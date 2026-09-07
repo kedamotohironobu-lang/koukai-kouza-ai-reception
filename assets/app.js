@@ -1,0 +1,1181 @@
+(() => {
+  'use strict';
+
+  const CONFIG = window.APP_CONFIG || {};
+  const CORE = window.ReceptionCore;
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+  const els = {
+    landing: $('#landingScreen'),
+    reception: $('#receptionScreen'),
+    startVoice: $('#startVoiceBtn'),
+    startChat: $('#startChatBtn'),
+    reset: $('#resetBtn'),
+    progress: $('#progress'),
+    statusBar: $('#statusBar'),
+    statusText: $('#statusText'),
+    messages: $('#messages'),
+    suggestions: $('#suggestions'),
+    voiceTab: $('#voiceTab'),
+    chatTab: $('#chatTab'),
+    voicePanel: $('#voicePanel'),
+    chatPanel: $('#chatPanel'),
+    chatInput: $('#chatInput'),
+    mic: $('#micBtn'),
+    voicePrompt: $('#voicePrompt'),
+    liveTranscript: $('#liveTranscript'),
+    toChat: $('#toChatBtn'),
+    toVoice: $('#toVoiceBtn'),
+    speaker: $('#speakerBtn'),
+    agentCaption: $('#agentCaption'),
+    help: $('#helpBtn'),
+    helpDialog: $('#helpDialog'),
+    closeHelp: $('#closeHelpBtn'),
+    toast: $('#toast')
+  };
+
+  const state = {
+    stage: 'landing',
+    inputMode: 'voice',
+    speakerOn: true,
+    courses: [],
+    selectedCourse: null,
+    method: '',
+    affiliation: '',
+    name: '',
+    phone: '',
+    receiptNumber: '',
+    recognition: null,
+    recognizing: false,
+    lastSpeechFinal: '',
+    recognitionErrors: 0,
+    geminiLive: null,
+    geminiLiveReady: false,
+    geminiLiveConnecting: false,
+    geminiLiveError: '',
+    geminiMicStreaming: false,
+    geminiMediaStream: null,
+    geminiInputContext: null,
+    geminiInputSource: null,
+    geminiInputProcessor: null,
+    geminiInputSink: null,
+    geminiOutputContext: null,
+    geminiOutputNextTime: 0,
+    geminiOutputSources: new Set(),
+    geminiUserTranscript: '',
+    geminiModelTranscript: '',
+    geminiTranscriptCommitTimer: null,
+    geminiTranscriptCommitted: false
+  };
+
+  const STAGE_GROUP = {
+    landing: 'search',
+    search: 'search',
+    course: 'search',
+    method: 'method',
+    affiliation: 'person',
+    name: 'person',
+    phone: 'person',
+    confirm: 'confirm',
+    complete: 'complete'
+  };
+  const GROUPS = ['search', 'method', 'person', 'confirm', 'complete'];
+  const MOBILE_BREAKPOINT = 760;
+
+  function isMobileView() {
+    return window.innerWidth <= MOBILE_BREAKPOINT;
+  }
+
+  function applyMobileModeClass(mode = state.inputMode) {
+    document.body.classList.remove('mobile-voice-mode', 'mobile-chat-mode');
+    if (!isMobileView()) return;
+    document.body.classList.add(mode === 'voice' ? 'mobile-voice-mode' : 'mobile-chat-mode');
+  }
+
+  async function boot() {
+    bindEvents();
+    try {
+      if (Array.isArray(window.COURSE_DATA) && window.COURSE_DATA.length) {
+        state.courses = Array.from(window.COURSE_DATA);
+      } else {
+        const response = await fetch('assets/courses.json', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        state.courses = await response.json();
+      }
+      setStatus(`${state.courses.length}件の公開講座マスターを読み込みました`);
+    } catch (err) {
+      console.error(err);
+      setStatus('講座データを読み込めませんでした', 'error');
+      showToast('講座データの読み込みに失敗しました。');
+    }
+    initSpeechRecognition();
+    initGeminiLiveBridge();
+    applyMobileModeClass();
+    window.addEventListener('resize', () => applyMobileModeClass());
+  }
+
+  function bindEvents() {
+    els.startVoice.addEventListener('click', () => startReception('voice'));
+    els.startChat.addEventListener('click', () => startReception('chat'));
+    els.reset.addEventListener('click', resetReception);
+    els.voiceTab.addEventListener('click', () => switchMode('voice'));
+    els.chatTab.addEventListener('click', () => switchMode('chat'));
+    els.toChat.addEventListener('click', () => switchMode('chat'));
+    els.toVoice.addEventListener('click', () => switchMode('voice'));
+    els.mic.addEventListener('click', () => { void toggleVoiceInput(); });
+    els.chatPanel.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const text = els.chatInput.value.trim();
+      if (!text) return;
+      els.chatInput.value = '';
+      receiveInput(text);
+    });
+    els.speaker.addEventListener('click', () => {
+      state.speakerOn = !state.speakerOn;
+      els.speaker.classList.toggle('active', state.speakerOn);
+      els.speaker.setAttribute('aria-pressed', String(state.speakerOn));
+      els.speaker.textContent = state.speakerOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
+      if (!state.speakerOn && 'speechSynthesis' in window) speechSynthesis.cancel();
+      if (!state.speakerOn) stopGeminiOutputAudio();
+    });
+    els.help.addEventListener('click', () => els.helpDialog.showModal());
+    els.closeHelp.addEventListener('click', () => els.helpDialog.close());
+  }
+
+  function startReception(mode) {
+    if (!state.courses.length) {
+      showToast('講座データを読み込んでいます。少し待ってからもう一度お試しください。');
+      return;
+    }
+    els.landing.classList.add('hidden');
+    els.reception.classList.remove('hidden');
+    switchMode(mode, { silent: true });
+    applyMobileModeClass(mode);
+    state.stage = 'search';
+    updateProgress();
+    els.messages.innerHTML = '';
+    els.suggestions.innerHTML = '';
+    botSay('こんにちは。兵庫県立総合教育センターの公開講座をご案内します。\n第何回の講座か、または「生成AI」「不登校」のように学びたい内容をお話しください。');
+    showSearchExamples();
+    setStatus('希望する講座をお話しください');
+    if (mode === 'voice') {
+      void ensureGeminiLiveConnection();
+      setTimeout(() => {
+        if (!geminiLiveConfigured() && !speechRecognitionAvailable()) {
+          botSay('このブラウザでは音声入力を利用できないため、チャット入力に切り替えました。');
+          switchMode('chat', { silent: true });
+        }
+      }, 500);
+    }
+  }
+
+  function resetReception() {
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    stopRecognition();
+    void stopGeminiAudioCapture({ sendEnd: false });
+    closeGeminiLiveConnection();
+    clearGeminiTranscriptCommitTimer();
+    Object.assign(state, {
+      stage: 'search', selectedCourse: null, method: '', affiliation: '', name: '', phone: '', receiptNumber: '', lastSpeechFinal: '', recognitionErrors: 0, geminiLiveReady: false, geminiLiveConnecting: false, geminiLiveError: '', geminiMicStreaming: false, geminiUserTranscript: '', geminiModelTranscript: '', geminiTranscriptCommitted: false
+    });
+    els.messages.innerHTML = '';
+    els.suggestions.innerHTML = '';
+    botSay('最初からやり直します。\n第何回の講座か、学びたい内容をお話しください。');
+    showSearchExamples();
+    updateProgress();
+    setStatus('希望する講座をお話しください');
+  }
+
+  function switchMode(mode, options = {}) {
+    state.inputMode = mode;
+    const voice = mode === 'voice';
+    els.voiceTab.classList.toggle('active', voice);
+    els.chatTab.classList.toggle('active', !voice);
+    els.voiceTab.setAttribute('aria-selected', String(voice));
+    els.chatTab.setAttribute('aria-selected', String(!voice));
+    els.voicePanel.classList.toggle('hidden', !voice);
+    els.chatPanel.classList.toggle('hidden', voice);
+    if (!voice) {
+      stopRecognition();
+      void stopGeminiAudioCapture({ sendEnd: false });
+      closeGeminiLiveConnection();
+      setTimeout(() => els.chatInput.focus(), 30);
+    } else if (state.stage !== 'landing') {
+      void ensureGeminiLiveConnection();
+    }
+    applyMobileModeClass(mode);
+    if (!options.silent) {
+      showToast(voice ? '音声入力に切り替えました' : 'チャット入力に切り替えました');
+    }
+  }
+
+  function receiveInput(rawText) {
+    const text = normalizeSpace(rawText);
+    if (!text) return;
+    userSay(text);
+    setStatus('内容を確認しています…');
+    window.setTimeout(() => routeInput(text), 180);
+  }
+
+  function routeInput(text) {
+    switch (state.stage) {
+      case 'search': return handleSearch(text);
+      case 'course': return handleCourseVoiceChoice(text);
+      case 'method': return handleMethod(text);
+      case 'affiliation': return handleAffiliation(text);
+      case 'name': return handleName(text);
+      case 'phone': return handlePhone(text);
+      case 'confirm': return handleConfirm(text);
+      case 'complete': return botSay('この受付は完了しています。「やり直す」を押すと最初から開始できます。');
+      default: return handleSearch(text);
+    }
+  }
+
+  function handleSearch(text) {
+    const matches = searchCourses(text);
+    if (!matches.length) {
+      botSay('該当する講座を確認できませんでした。講座番号、演題の一部、または「生成AI」「不登校」のようなキーワードでもう一度お知らせください。');
+      showSearchExamples();
+      setStatus('別の言葉で講座を探してください');
+      return;
+    }
+
+    const exact = exactCourseFromText(text);
+    if (exact) {
+      selectCourse(exact.key);
+      return;
+    }
+
+    botSay(`${matches.length}件の候補が見つかりました。希望する講座を選んでください。`);
+    renderCourseCards(matches.slice(0, 5));
+    state.stage = 'course';
+    updateProgress();
+    setStatus('候補から講座を選んでください');
+  }
+
+  function handleCourseVoiceChoice(text) {
+    const exact = exactCourseFromText(text);
+    if (exact) return selectCourse(exact.key);
+
+    const matches = searchCourses(text);
+    if (matches.length === 1) return selectCourse(matches[0].key);
+
+    botSay('講座を特定できませんでした。画面の候補を選ぶか、「第50回」のように講座番号をお話しください。');
+  }
+
+  function selectCourse(key) {
+    const course = state.courses.find((item) => item.key === key);
+    if (!course) return;
+    state.selectedCourse = course;
+    state.stage = 'method';
+    updateProgress();
+    els.suggestions.innerHTML = '';
+
+    const deadlineText = formatDate(course.deadline) || '資料記載なし';
+    const methods = [];
+    if (course.onsiteAvailable) methods.push('集合研修');
+    if (course.vodAvailable) methods.push('VOD');
+
+    botSay(`${course.display}「${course.title}」ですね。正式資料の内容を表示します。`);
+    renderCourseDetail(course);
+
+    if (isDeadlinePast(course.deadline)) {
+      botSay(`申込締切日は ${deadlineText} です。現在は締切日を過ぎているため、この試作画面では受付を進めません。職員確認が必要です。`);
+      setStatus('申込締切日を過ぎています', 'warning');
+      return;
+    }
+
+    if (!methods.length) {
+      botSay('この講座は現在選択できる受講方法がありません。別の講座をお選びください。');
+      setStatus('受講方法を選択できません', 'warning');
+      return;
+    }
+
+    botSay(`受講方法は ${methods.join(' または ')} が選べます。どちらを希望しますか？`);
+    renderMethodChoices(course);
+    setStatus('受講方法を選んでください');
+  }
+
+  function handleMethod(text) {
+    if (!state.selectedCourse) {
+      state.stage = 'search';
+      return handleSearch(text);
+    }
+    const normalized = normalizeForSearch(text);
+    let method = '';
+    if (normalized.includes('vod') || normalized.includes('動画') || normalized.includes('オンデマンド')) method = 'VOD';
+    if (normalized.includes('集合') || normalized.includes('会場') || normalized.includes('対面')) method = '集合研修';
+
+    if (!method) {
+      botSay('「集合研修」または「VOD」のどちらかをお知らせください。');
+      return;
+    }
+    chooseMethod(method);
+  }
+
+  function chooseMethod(method) {
+    const c = state.selectedCourse;
+    if (!c) return;
+    if (method === '集合研修' && !c.onsiteAvailable) {
+      botSay('正式資料では、この講座は集合研修での受付ができません。VODを選択してください。');
+      return;
+    }
+    if (method === 'VOD' && !c.vodAvailable) {
+      botSay('正式資料では、この講座はVODでの受付ができません。集合研修を選択してください。');
+      return;
+    }
+    state.method = method;
+    state.stage = 'affiliation';
+    updateProgress();
+    els.suggestions.innerHTML = '';
+    botSay(`${method}ですね。続いて申込者情報を1項目ずつ確認します。\nまず、所属をお知らせください。`);
+    setStatus('所属をお話しください');
+  }
+
+  function handleAffiliation(text) {
+    if (text.length < 2) {
+      botSay('所属名をもう一度お知らせください。');
+      return;
+    }
+    state.affiliation = text;
+    state.stage = 'name';
+    botSay(`所属は「${text}」ですね。次に、お名前をお知らせください。`);
+    setStatus('氏名をお話しください');
+  }
+
+  function handleName(text) {
+    if (text.length < 2) {
+      botSay('お名前をもう一度お知らせください。');
+      return;
+    }
+    state.name = text;
+    state.stage = 'phone';
+    botSay(`お名前は「${text}」ですね。最後に、所属の電話番号をお知らせください。`);
+    setStatus('所属電話番号をお話しください');
+  }
+
+  function handlePhone(text) {
+    const phone = normalizePhone(text);
+    if (phone.length < 8 || phone.length > 15) {
+      botSay('電話番号を確認できませんでした。数字で、所属の電話番号をもう一度お知らせください。');
+      return;
+    }
+    state.phone = formatPhoneDisplay(phone);
+    state.stage = 'confirm';
+    updateProgress();
+    botSay('ありがとうございます。申込内容を確認します。');
+    renderConfirmation();
+    botSay('この内容でよろしければ「はい」、修正する場合は「修正」とお知らせください。');
+    setStatus('申込内容をご確認ください');
+  }
+
+  function handleConfirm(text) {
+    const normalized = normalizeForSearch(text);
+    if (/^(はい|ok|オーケー|お願いします|これで|正しい)/.test(normalized)) {
+      return completeReception();
+    }
+    if (normalized.includes('修正') || normalized.includes('変更') || normalized.includes('違')) {
+      renderCorrectionChoices();
+      botSay('修正する項目を選んでください。');
+      return;
+    }
+    botSay('内容が正しければ「はい」、変更する場合は「修正」とお知らせください。');
+  }
+
+  async function completeReception() {
+    setStatus('仮受付内容を作成しています…');
+    try {
+      const result = await submitReception();
+      state.receiptNumber = result.receiptNumber;
+      state.stage = 'complete';
+      updateProgress();
+      els.suggestions.innerHTML = '';
+      botSay('仮受付内容の作成が完了しました。');
+      renderCompletion(result);
+      setStatus(CONFIG.integrationMode === 'mock' ? 'STEP9画面テスト完了（実登録なし）' : '仮受付が完了しました');
+    } catch (err) {
+      console.error(err);
+      botSay('仮受付処理でエラーが発生しました。入力内容は送信されていません。');
+      setStatus('仮受付処理エラー', 'error');
+    }
+  }
+
+  async function submitReception() {
+    const payload = {
+      channel: state.inputMode === 'voice' ? 'Web音声' : 'Webチャット',
+      affiliation: state.affiliation,
+      name: state.name,
+      phone: state.phone,
+      courseKey: state.selectedCourse.key,
+      displayCourse: state.selectedCourse.display,
+      method: state.method
+    };
+
+    if (CONFIG.integrationMode !== 'secure-bridge') {
+      await delay(450);
+      return {
+        ok: true,
+        mock: true,
+        receiptNumber: `${CONFIG.year || 'R8'}-DEMO-${String(Math.floor(Math.random() * 9000) + 1000)}`,
+        payload
+      };
+    }
+
+    if (!CONFIG.bridgeEndpoint) throw new Error('安全な中継APIが未設定です');
+    const response = await fetch(CONFIG.bridgeEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error(`受付API HTTP ${response.status}`);
+    const data = await response.json();
+    if (!data || !data.ok || !data.receiptNumber) throw new Error('受付APIから正常な受付番号を取得できませんでした');
+    return data;
+  }
+
+  function searchCourses(query) {
+    return CORE.searchCourses(state.courses, query);
+  }
+
+  function exactCourseFromText(text) {
+    return CORE.exactCourseFromText(state.courses, text);
+  }
+
+  function extractCourseNumber(text) {
+    return CORE.extractCourseNumber(text);
+  }
+
+  function extractBranch(text) {
+    return CORE.extractBranch(text);
+  }
+
+  function renderCourseCards(courses) {
+    els.suggestions.innerHTML = `<div class="course-list">${courses.map((course) => `
+      <button class="course-card" type="button" data-course-key="${escapeHtml(course.key)}">
+        <div class="course-top"><span class="course-no">${escapeHtml(course.display)}</span><span>選択 ›</span></div>
+        <div class="course-title">${escapeHtml(course.title)}</div>
+        <div class="course-meta">
+          <span class="tag ${course.onsiteAvailable ? '' : 'off'}">集合 ${course.onsiteAvailable ? '○' : '－'}</span>
+          <span class="tag ${course.vodAvailable ? '' : 'off'}">VOD ${course.vodAvailable ? '○' : '－'}</span>
+          ${course.deadline ? `<span>締切 ${formatDate(course.deadline)}</span>` : ''}
+        </div>
+      </button>`).join('')}</div>`;
+    $$('[data-course-key]').forEach((button) => button.addEventListener('click', () => selectCourse(button.dataset.courseKey)));
+  }
+
+  function renderCourseDetail(course) {
+    const onsite = course.onsiteAvailable
+      ? `${formatDate(course.onsiteDate) || '日付記載なし'}${course.onsiteStart ? ` ${course.onsiteStart}～${course.onsiteEnd || ''}` : ''}`
+      : '受付不可';
+    const vod = course.vodAvailable
+      ? `${formatDate(course.vodStart) || '開始日記載なし'} ～ ${formatDate(course.vodEnd) || '終了日記載なし'}`
+      : '受付不可';
+
+    els.suggestions.innerHTML = `
+      <div class="detail-card">
+        <div class="course-no">${escapeHtml(course.display)}</div>
+        <h3>${escapeHtml(course.title)}</h3>
+        <dl class="detail-grid">
+          <dt>講師</dt><dd>${escapeHtml(course.lecturer || '資料記載なし')}</dd>
+          <dt>申込締切</dt><dd>${escapeHtml(formatDate(course.deadline) || '資料記載なし')}</dd>
+          <dt>集合研修</dt><dd>${escapeHtml(onsite)}</dd>
+          <dt>VOD</dt><dd>${escapeHtml(vod)}</dd>
+        </dl>
+        ${course.overview ? `<p class="detail-overview">${escapeHtml(course.overview)}</p>` : ''}
+        <div class="detail-actions">
+          <button class="action-btn secondary" type="button" id="backSearchBtn">別の講座を探す</button>
+        </div>
+      </div>`;
+    $('#backSearchBtn')?.addEventListener('click', () => {
+      state.selectedCourse = null;
+      state.stage = 'search';
+      updateProgress();
+      els.suggestions.innerHTML = '';
+      botSay('別の講座を探します。希望する講座番号や内容をお知らせください。');
+      showSearchExamples();
+      setStatus('希望する講座をお話しください');
+    });
+  }
+
+  function renderMethodChoices(course) {
+    const holder = document.createElement('div');
+    holder.className = 'chip-row';
+    if (course.onsiteAvailable) holder.append(makeChip(`👥 集合研修 ${formatDate(course.onsiteDate) || ''}`, () => chooseMethod('集合研修')));
+    if (course.vodAvailable) holder.append(makeChip(`💻 VOD ${formatDate(course.vodStart) || ''}～`, () => chooseMethod('VOD')));
+    els.suggestions.append(holder);
+  }
+
+  function renderConfirmation() {
+    const c = state.selectedCourse;
+    els.suggestions.innerHTML = `
+      <div class="confirm-card">
+        <div class="confirm-title">申込内容をご確認ください</div>
+        <dl class="confirm-list">
+          <dt>所属</dt><dd>${escapeHtml(state.affiliation)}</dd>
+          <dt>氏名</dt><dd>${escapeHtml(state.name)}</dd>
+          <dt>電話番号</dt><dd>${escapeHtml(state.phone)}</dd>
+          <dt>講座</dt><dd>${escapeHtml(c.display)} ${escapeHtml(c.title)}</dd>
+          <dt>受講方法</dt><dd>${escapeHtml(state.method)}</dd>
+        </dl>
+        <div class="detail-actions" style="padding:12px 13px">
+          <button id="confirmYesBtn" class="action-btn primary" type="button">この内容で仮受付</button>
+          <button id="confirmEditBtn" class="action-btn secondary" type="button">修正する</button>
+        </div>
+      </div>`;
+    $('#confirmYesBtn')?.addEventListener('click', completeReception);
+    $('#confirmEditBtn')?.addEventListener('click', renderCorrectionChoices);
+  }
+
+  function renderCorrectionChoices() {
+    els.suggestions.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'chip-row';
+    const choices = [
+      ['講座', () => { state.stage = 'search'; state.selectedCourse = null; state.method = ''; botSay('講座を選び直します。希望する講座をお知らせください。'); showSearchExamples(); }],
+      ['受講方法', () => { state.stage = 'method'; botSay('受講方法を選び直します。'); renderMethodChoices(state.selectedCourse); }],
+      ['所属', () => { state.stage = 'affiliation'; botSay('所属をもう一度お知らせください。'); }],
+      ['氏名', () => { state.stage = 'name'; botSay('お名前をもう一度お知らせください。'); }],
+      ['電話番号', () => { state.stage = 'phone'; botSay('所属の電話番号をもう一度お知らせください。'); }]
+    ];
+    choices.forEach(([label, fn]) => row.append(makeChip(label, () => { els.suggestions.innerHTML = ''; fn(); updateProgress(); })));
+    els.suggestions.append(row);
+  }
+
+  function renderCompletion(result) {
+    const c = state.selectedCourse;
+    const draft = buildEmailDraft(result.receiptNumber);
+    const emailEnabled = CONFIG.integrationMode === 'secure-bridge' && !result.mock;
+
+    els.suggestions.innerHTML = `
+      <div class="complete-card">
+        <div class="complete-icon">✅</div>
+        <h3>${result.mock ? 'STEP9 画面テスト完了' : '仮受付が完了しました'}</h3>
+        <div>受付番号</div>
+        <div class="receipt-number">${escapeHtml(result.receiptNumber)}</div>
+        ${result.mock ? '<div class="demo-warning">この番号は画面確認用のDEMO番号です。Googleスプレッドシートには登録されていません。</div>' : '<p>この番号は大切に保管してください。</p>'}
+        <div class="email-draft">${escapeHtml(draft)}</div>
+        <div class="detail-actions" style="justify-content:center">
+          <button id="copyDraftBtn" class="action-btn secondary" type="button">確認メール文面をコピー</button>
+          <button id="openMailBtn" class="action-btn primary" type="button" ${emailEnabled ? '' : 'disabled'}>${emailEnabled ? 'メールアプリを開く' : 'STEP10～11でメール連携'}</button>
+        </div>
+      </div>`;
+
+    $('#copyDraftBtn')?.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(draft);
+        showToast('確認メール文面をコピーしました');
+      } catch {
+        showToast('コピーできませんでした。文面を選択してコピーしてください。');
+      }
+    });
+
+    if (emailEnabled) {
+      $('#openMailBtn')?.addEventListener('click', () => {
+        const subject = `【公開講座受付確認】${result.receiptNumber}`;
+        location.href = `mailto:${encodeURIComponent(CONFIG.receptionEmail)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(draft)}`;
+      });
+    }
+  }
+
+  function buildEmailDraft(receipt) {
+    return [
+      `送信先：${CONFIG.receptionEmail}`,
+      `件名：【公開講座受付確認】${receipt}`,
+      '',
+      `受付番号：${receipt}`,
+      `所属：${state.affiliation}`,
+      `氏名：${state.name}`,
+      `希望講座：${state.selectedCourse.display}`,
+      `受講方法：${state.method}`
+    ].join('\n');
+  }
+
+  function showSearchExamples() {
+    els.suggestions.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'chip-row';
+    [
+      ['第50回を探す', '第50回'],
+      ['生成AI', '生成AI'],
+      ['不登校', '不登校'],
+      ['コミュニケーション', 'コミュニケーション']
+    ].forEach(([label, text]) => row.append(makeChip(label, () => receiveInput(text))));
+    els.suggestions.append(row);
+  }
+
+  function makeChip(label, onClick) {
+    const button = document.createElement('button');
+    button.className = 'chip';
+    button.type = 'button';
+    button.textContent = label;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  function botSay(text, options = {}) {
+    addMessage('bot', text);
+    const firstLine = text.split('\n')[0];
+    els.agentCaption.textContent = firstLine.length > 84 ? `${firstLine.slice(0, 84)}…` : firstLine;
+    if (state.speakerOn && !options.silent) speak(text);
+  }
+
+  function userSay(text) { addMessage('user', text); }
+
+  function addMessage(role, text) {
+    const wrapper = document.createElement('div');
+    wrapper.className = `message ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    wrapper.append(bubble);
+    els.messages.append(wrapper);
+    requestAnimationFrame(() => { els.messages.scrollTop = els.messages.scrollHeight; });
+  }
+
+  function speak(text) {
+    if (!('speechSynthesis' in window) || !state.speakerOn) return;
+    try {
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text.replace(/\n/g, ' '));
+      utterance.lang = 'ja-JP';
+      utterance.rate = 1.03;
+      utterance.pitch = 1.0;
+      speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.warn('音声読み上げを利用できません。画面表示は継続します。', err);
+    }
+  }
+
+
+  function geminiLiveConfigured() {
+    return Boolean((CONFIG.geminiLive || {}).enabled && state.geminiLive);
+  }
+
+  function initGeminiLiveBridge() {
+    const liveConfig = CONFIG.geminiLive || {};
+    if (!liveConfig.enabled || typeof window.GeminiLiveBridge !== 'function') return;
+    state.geminiLive = new window.GeminiLiveBridge({
+      model: liveConfig.model,
+      tokenEndpoint: liveConfig.tokenEndpoint,
+      voiceName: liveConfig.voiceName,
+      onStatus: (status) => {
+        if (status.phase === 'ready') {
+          state.geminiLiveReady = true;
+          state.geminiLiveError = '';
+        } else if (status.phase === 'closed') {
+          state.geminiLiveReady = false;
+          void stopGeminiAudioCapture({ sendEnd: false });
+        }
+        console.info(`[Gemini Live] ${status.message}`);
+      },
+      onMessage: handleGeminiLiveMessage
+    });
+    window.addEventListener('beforeunload', () => {
+      void stopGeminiAudioCapture({ sendEnd: false });
+      closeGeminiLiveConnection();
+    }, { once: true });
+  }
+
+  function handleGeminiLiveMessage(message) {
+    if (message?.goAway) {
+      console.warn('[Gemini Live] goAway', message.goAway);
+      showToast('Gemini Live接続更新の準備が必要です');
+    }
+
+    const content = message?.serverContent;
+    if (!content) return;
+    const liveConfig = CONFIG.geminiLive || {};
+    const routeOfficialMaster = liveConfig.routeInputToReception === true;
+    const suppressModelOutput = liveConfig.suppressModelOutput === true;
+
+    if (content.interrupted) {
+      stopGeminiOutputAudio();
+    }
+
+    const interimText = normalizeSpace(content.interimInputTranscription?.text || '');
+    if (interimText) {
+      els.liveTranscript.textContent = interimText;
+    }
+
+    // inputTranscription は Gemini Live が確定した利用者発話。
+    // STEP10-3では、この確定文字列だけを既存受付ロジックへ渡す。
+    const inputText = normalizeSpace(content.inputTranscription?.text || '');
+    if (inputText) {
+      state.geminiUserTranscript = appendTranscript(state.geminiUserTranscript, inputText);
+      els.liveTranscript.textContent = state.geminiUserTranscript;
+      if (routeOfficialMaster) scheduleGeminiTranscriptCommit();
+    }
+
+    const outputText = normalizeSpace(content.outputTranscription?.text || '');
+    if (outputText) {
+      state.geminiModelTranscript = appendTranscript(state.geminiModelTranscript, outputText);
+      if (!suppressModelOutput) {
+        const caption = state.geminiModelTranscript || outputText;
+        els.agentCaption.textContent = caption.length > 100 ? `${caption.slice(0, 100)}…` : caption;
+      }
+    }
+
+    if (!suppressModelOutput && content.modelTurn?.parts) {
+      for (const part of content.modelTurn.parts) {
+        const inlineData = part?.inlineData;
+        if (!inlineData?.data) continue;
+        const mimeType = String(inlineData.mimeType || 'audio/pcm;rate=24000');
+        if (mimeType.startsWith('audio/')) {
+          enqueueGeminiOutputAudio(inlineData.data, parsePcmRate(mimeType) || Number(liveConfig.outputSampleRate) || 24000);
+        }
+      }
+    }
+
+    if (content.turnComplete) {
+      if (routeOfficialMaster) {
+        // プッシュ・トゥ・トーク中の自然な間では確定させない。
+        // マイク停止後だけ受付ロジックへ渡す。
+        if (!state.geminiMicStreaming) scheduleGeminiTranscriptCommit();
+        state.geminiModelTranscript = '';
+        els.voicePrompt.textContent = 'マイクを押してお話しください';
+        return;
+      }
+
+      const userText = normalizeSpace(state.geminiUserTranscript);
+      const modelText = normalizeSpace(state.geminiModelTranscript);
+      if (userText) addMessage('user', userText);
+      if (modelText) addMessage('bot', modelText);
+      state.geminiUserTranscript = '';
+      state.geminiModelTranscript = '';
+      els.voicePrompt.textContent = 'マイクを押してお話しください';
+      if (!state.geminiMicStreaming) {
+        els.liveTranscript.textContent = '続けて話す場合は、もう一度マイクを押してください';
+        setStatus('Gemini Live 日本語音声テスト完了');
+      }
+    }
+  }
+
+  function scheduleGeminiTranscriptCommit() {
+    if (state.geminiTranscriptCommitted || state.geminiMicStreaming) return;
+    clearGeminiTranscriptCommitTimer();
+    state.geminiTranscriptCommitTimer = window.setTimeout(() => {
+      state.geminiTranscriptCommitTimer = null;
+      commitGeminiTranscriptToReception();
+    }, 420);
+  }
+
+  function commitGeminiTranscriptToReception() {
+    if (state.geminiTranscriptCommitted) return;
+    const finalText = normalizeSpace(state.geminiUserTranscript);
+    if (!finalText) return;
+
+    state.geminiTranscriptCommitted = true;
+    clearGeminiTranscriptCommitTimer();
+    stopGeminiOutputAudio();
+    state.geminiUserTranscript = '';
+    state.geminiModelTranscript = '';
+    els.liveTranscript.textContent = finalText;
+    setStatus('正式マスターで確認しています…');
+
+    // ここから先はSTEP9から維持している決定的な受付ルート。
+    // Geminiに講座検索結果を生成させず、正式マスターのみを検索する。
+    receiveInput(finalText);
+  }
+
+  function clearGeminiTranscriptCommitTimer() {
+    if (state.geminiTranscriptCommitTimer) {
+      window.clearTimeout(state.geminiTranscriptCommitTimer);
+      state.geminiTranscriptCommitTimer = null;
+    }
+  }
+
+  function appendTranscript(current, next) {
+    const a = normalizeSpace(current || '');
+    const b = normalizeSpace(next || '');
+    if (!a) return b;
+    if (!b || a === b || a.endsWith(b)) return a;
+    if (b.startsWith(a)) return b;
+    return `${a} ${b}`;
+  }
+
+  async function ensureGeminiLiveConnection() {
+    const liveConfig = CONFIG.geminiLive || {};
+    if (!liveConfig.enabled || !state.geminiLive || state.geminiLiveReady || state.geminiLiveConnecting) return;
+    state.geminiLiveConnecting = true;
+    try {
+      await state.geminiLive.connect();
+      state.geminiLiveReady = true;
+      state.geminiLiveError = '';
+      showToast('Gemini Live 接続済み');
+    } catch (error) {
+      state.geminiLiveReady = false;
+      state.geminiLiveError = error?.message || 'Gemini Live接続エラー';
+      console.warn('[Gemini Live] STEP10-3 接続に失敗。STEP9音声入力へフォールバックします。', error);
+      if (liveConfig.fallbackToStep9Voice !== false) {
+        showToast('Gemini Live未接続：STEP9音声入力で継続します');
+      }
+    } finally {
+      state.geminiLiveConnecting = false;
+    }
+  }
+
+  async function toggleVoiceInput() {
+    if (!window.isSecureContext) {
+      botSay('マイクを使うため、HTTPSまたは localhost から開いてください。チャット入力はそのまま利用できます。', { silent: true });
+      switchMode('chat', { silent: true });
+      return;
+    }
+
+    const liveConfig = CONFIG.geminiLive || {};
+    if (liveConfig.enabled && state.geminiLive) {
+      if (state.geminiMicStreaming) {
+        await stopGeminiAudioCapture({ sendEnd: true });
+        return;
+      }
+      await ensureGeminiLiveConnection();
+      if (state.geminiLiveReady && state.geminiLive?.isReady()) {
+        try {
+          await startGeminiAudioCapture();
+          return;
+        } catch (error) {
+          console.warn('[Gemini Live] マイクストリーミング開始失敗', error);
+          showToast('Gemini音声入力を開始できませんでした');
+          if (liveConfig.fallbackToStep9Voice === false) return;
+        }
+      }
+    }
+
+    toggleRecognition();
+  }
+
+  async function startGeminiAudioCapture() {
+    if (state.geminiMicStreaming) return;
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia unavailable');
+    if (!state.geminiLive?.isReady()) throw new Error('Gemini Live is not ready');
+
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    stopRecognition();
+    stopGeminiOutputAudio();
+
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    });
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      mediaStream.getTracks().forEach((track) => track.stop());
+      throw new Error('AudioContext unavailable');
+    }
+
+    const audioContext = new AudioContextClass();
+    await audioContext.resume();
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    const sink = audioContext.createGain();
+    sink.gain.value = 0;
+
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(audioContext.destination);
+
+    const targetRate = Number((CONFIG.geminiLive || {}).inputSampleRate) || 16000;
+    processor.onaudioprocess = (event) => {
+      if (!state.geminiMicStreaming || !state.geminiLive?.isReady()) return;
+      const input = event.inputBuffer.getChannelData(0);
+      const resampled = resampleFloat32(input, audioContext.sampleRate, targetRate);
+      if (!resampled.length) return;
+      const pcm16 = float32ToPcm16(resampled);
+      state.geminiLive.sendAudioPcmBase64(arrayBufferToBase64(pcm16.buffer), targetRate);
+    };
+
+    state.geminiMediaStream = mediaStream;
+    state.geminiInputContext = audioContext;
+    state.geminiInputSource = source;
+    state.geminiInputProcessor = processor;
+    state.geminiInputSink = sink;
+    state.geminiMicStreaming = true;
+    clearGeminiTranscriptCommitTimer();
+    state.geminiUserTranscript = '';
+    state.geminiModelTranscript = '';
+    state.geminiTranscriptCommitted = false;
+
+    els.mic.classList.add('listening');
+    els.statusBar.classList.add('listening');
+    els.voicePrompt.textContent = 'お話しください（もう一度押すと終了）';
+    els.liveTranscript.textContent = '日本語音声をGemini Liveへ送信しています';
+    setStatus('Gemini Liveで音声を聞き取っています');
+  }
+
+  async function stopGeminiAudioCapture(options = {}) {
+    const wasStreaming = state.geminiMicStreaming;
+    state.geminiMicStreaming = false;
+
+    if (state.geminiInputProcessor) {
+      state.geminiInputProcessor.onaudioprocess = null;
+      try { state.geminiInputProcessor.disconnect(); } catch (_) { /* noop */ }
+    }
+    if (state.geminiInputSource) {
+      try { state.geminiInputSource.disconnect(); } catch (_) { /* noop */ }
+    }
+    if (state.geminiInputSink) {
+      try { state.geminiInputSink.disconnect(); } catch (_) { /* noop */ }
+    }
+    if (state.geminiMediaStream) {
+      state.geminiMediaStream.getTracks().forEach((track) => track.stop());
+    }
+    if (state.geminiInputContext && state.geminiInputContext.state !== 'closed') {
+      try { await state.geminiInputContext.close(); } catch (_) { /* noop */ }
+    }
+
+    state.geminiMediaStream = null;
+    state.geminiInputContext = null;
+    state.geminiInputSource = null;
+    state.geminiInputProcessor = null;
+    state.geminiInputSink = null;
+
+    els.mic.classList.remove('listening');
+    els.statusBar.classList.remove('listening');
+    els.voicePrompt.textContent = 'マイクを押してお話しください';
+
+    if (wasStreaming && options.sendEnd !== false && state.geminiLive?.isReady()) {
+      state.geminiLive.endAudioStream();
+      if ((CONFIG.geminiLive || {}).routeInputToReception === true) {
+        els.liveTranscript.textContent = state.geminiUserTranscript || '音声を文字にしています…';
+        setStatus('音声を確定しています…');
+        if (state.geminiUserTranscript) scheduleGeminiTranscriptCommit();
+      } else {
+        els.liveTranscript.textContent = 'Geminiの返答を待っています…';
+        setStatus('Geminiが返答しています…');
+      }
+    }
+  }
+
+  function resampleFloat32(input, sourceRate, targetRate) {
+    if (!input?.length || !sourceRate || !targetRate) return new Float32Array(0);
+    if (sourceRate === targetRate) return new Float32Array(input);
+    const ratio = sourceRate / targetRate;
+    const outputLength = Math.max(1, Math.floor(input.length / ratio));
+    const output = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i += 1) {
+      const pos = i * ratio;
+      const index = Math.floor(pos);
+      const frac = pos - index;
+      const a = input[Math.min(index, input.length - 1)] || 0;
+      const b = input[Math.min(index + 1, input.length - 1)] || a;
+      output[i] = a + ((b - a) * frac);
+    }
+    return output;
+  }
+
+  function float32ToPcm16(input) {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i += 1) {
+      const sample = Math.max(-1, Math.min(1, input[i]));
+      output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    return output;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const stride = 0x8000;
+    for (let i = 0; i < bytes.length; i += stride) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + stride));
+    }
+    return btoa(binary);
+  }
+
+  function base64ToInt16(base64) {
+    const binary = atob(base64);
+    const byteLength = binary.length;
+    const buffer = new ArrayBuffer(byteLength);
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < byteLength; i += 1) bytes[i] = binary.charCodeAt(i);
+    return new Int16Array(buffer);
+  }
+
+  function parsePcmRate(mimeType) {
+    const match = String(mimeType || '').match(/rate=(\d+)/i);
+    return match ? Number(match[1]) : 0;
+  }
+
+  async function ensureGeminiOutputContext() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    if (!state.geminiOutputContext || state.geminiOutputContext.state === 'closed') {
+      state.geminiOutputContext = new AudioContextClass();
+      state.geminiOutputNextTime = 0;
+    }
+    if (state.geminiOutputContext.state === 'suspended') {
+      try { await state.geminiOutputContext.resume(); } catch (_) { /* noop */ }
+    }
+    return state.geminiOutputContext;
+  }
+
+  async function enqueueGeminiOutputAudio(base64, sampleRate = 24000) {
+    if (!state.speakerOn || !base64) return;
+    const context = await ensureGeminiOutputContext();
+    if (!context) return;
+
+    const pcm = base64ToInt16(base64);
+    if (!pcm.length) return;
+    const buffer = context.createBuffer(1, pcm.length, sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < pcm.length; i += 1) channel[i] = pcm[i] / 32768;
+
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(context.destination);
+    const startAt = Math.max(context.currentTime + 0.025, state.geminiOutputNextTime || 0);
+    source.start(startAt);
+    state.geminiOutputNextTime = startAt + buffer.duration;
+    state.geminiOutputSources.add(source);
+    source.onended = () => state.geminiOutputSources.delete(source);
+  }
+
+  function stopGeminiOutputAudio() {
+    state.geminiOutputSources.forEach((source) => {
+      try { source.stop(); } catch (_) { /* noop */ }
+    });
+    state.geminiOutputSources.clear();
+    if (state.geminiOutputContext) state.geminiOutputNextTime = state.geminiOutputContext.currentTime;
+  }
+
+  function closeGeminiLiveConnection() {
+    clearGeminiTranscriptCommitTimer();
+    stopGeminiOutputAudio();
+    if (state.geminiLive) state.geminiLive.close();
+    state.geminiLiveReady = false;
+    state.geminiLiveConnecting = false;
+  }
+
+  function initSpeechRecognition() {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) return;
+    const recognition = new Recognition();
+    recognition.lang = 'ja-JP';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      state.recognizing = true;
+      state.lastSpeechFinal = '';
+      els.mic.classList.add('listening');
+      els.statusBar.classList.add('listening');
+      els.voicePrompt.textContent = 'お話しください…';
+      els.liveTranscript.textContent = '音声を聞き取っています';
+      setStatus('音声を聞き取っています');
+    };
+
+    recognition.onresult = (event) => {
+      let interim = '';
+      let finalText = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalText += transcript;
+        else interim += transcript;
+      }
+      if (interim) els.liveTranscript.textContent = interim;
+      if (finalText) {
+        state.lastSpeechFinal = finalText.trim();
+        els.liveTranscript.textContent = state.lastSpeechFinal;
+      }
+    };
+
+    recognition.onerror = (event) => {
+      state.recognitionErrors += 1;
+      const recoverable = ['no-speech', 'audio-capture', 'not-allowed', 'service-not-allowed', 'network'].includes(event.error);
+      setStatus('音声入力を確認できませんでした', 'warning');
+      if (recoverable) {
+        botSay('音声をうまく聞き取れませんでした。チャット入力へ切り替えて続けることもできます。', { silent: true });
+        if (state.recognitionErrors >= 2 || ['not-allowed', 'service-not-allowed', 'audio-capture'].includes(event.error)) {
+          switchMode('chat', { silent: true });
+          showToast('音声入力が難しいため、チャット入力へ切り替えました');
+        }
+      }
+    };
+
+    recognition.onend = () => {
+      state.recognizing = false;
+      els.mic.classList.remove('listening');
+      els.statusBar.classList.remove('listening');
+      els.voicePrompt.textContent = 'マイクを押してお話しください';
+      if (state.lastSpeechFinal) {
+        const finalText = state.lastSpeechFinal;
+        state.lastSpeechFinal = '';
+        receiveInput(finalText);
+      } else if (state.inputMode === 'voice') {
+        els.liveTranscript.textContent = 'もう一度マイクを押すか、チャット入力へ切り替えてください';
+      }
+    };
+
+    state.recognition = recognition;
+  }
+
+  function toggleRecognition() {
+    if (!speechRecognitionAvailable()) {
+      botSay('この環境では音声入力を利用できません。チャット入力に切り替えます。', { silent: true });
+      switchMode('chat', { silent: true });
+      return;
+    }
+    if (!window.isSecureContext) {
+      botSay('マイクを使うため、HTTPSまたは localhost から開いてください。チャット入力はそのまま利用できます。', { silent: true });
+      switchMode('chat', { silent: true });
+      return;
+    }
+    if (state.recognizing) stopRecognition();
+    else {
+      try { state.recognition.start(); }
+      catch (err) { console.warn(err); }
+    }
+  }
+
+  function stopRecognition() {
+    if (state.recognition && state.recognizing) {
+      try { state.recognition.stop(); } catch (_) { /* noop */ }
+    }
+  }
+
+  function speechRecognitionAvailable() { return Boolean(state.recognition); }
+
+  function updateProgress() {
+    const group = STAGE_GROUP[state.stage] || 'search';
+    const index = GROUPS.indexOf(group);
+    $$('#progress li').forEach((li) => {
+      const i = GROUPS.indexOf(li.dataset.step);
+      li.classList.toggle('active', i === index);
+      li.classList.toggle('done', i < index);
+    });
+  }
+
+  function setStatus(text, type = '') {
+    els.statusText.textContent = text;
+    els.statusBar.dataset.type = type;
+  }
+
+  function showToast(text) {
+    els.toast.textContent = text;
+    els.toast.classList.add('show');
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => els.toast.classList.remove('show'), 2600);
+  }
+
+  function normalizeForSearch(value) { return CORE.normalizeForSearch(value); }
+  function normalizeSpace(value) { return CORE.normalizeSpace(value); }
+  function normalizePhone(value) { return CORE.normalizePhone(value); }
+  function formatPhoneDisplay(digits) { return digits; }
+  function formatDate(iso) { return CORE.formatDate(iso); }
+  function isDeadlinePast(iso) { return CORE.isDeadlinePast(iso); }
+  function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+  }
+
+  boot();
+})();

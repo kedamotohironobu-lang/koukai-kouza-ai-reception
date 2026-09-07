@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f6b50">
+  <meta name="description" content="兵庫県立総合教育センター 公開講座AI音声受付（STEP10-2 Gemini Live日本語音声版）">
+  <title>公開講座 AI音声受付｜兵庫県立総合教育センター</title>
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">本文へ移動</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">H</span>
+        <div class="brand-copy">
+          <div class="brand-sub">兵庫県教育委員会</div>
+          <div class="brand-title">兵庫県立総合教育センター</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="env-badge">開発・検証版</span>
+        <a class="official-link" href="https://www.hyogo-c.ed.jp/~edu-center/" target="_blank" rel="noopener">公式サイト</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="landingScreen" class="landing" aria-labelledby="landingTitle">
+      <div class="landing-copy">
+        <p class="eyebrow">PUBLIC COURSE AI RECEPTION</p>
+        <h1 id="landingTitle">公開講座<br><span>AI音声受付</span></h1>
+        <p class="lead">AI受付スタッフと会話しながら、講座検索から申込み内容の確認まで進められます。</p>
+
+        <div class="voice-first-badge">
+          <span class="voice-first-icon">🎙</span>
+          <div>
+            <strong>音声入力が基本です</strong>
+            <span>うまく聞き取れない場合は、いつでもチャット入力へ切り替えられます。</span>
+          </div>
+        </div>
+
+        <div class="landing-buttons">
+          <button id="startVoiceBtn" class="primary-cta" type="button">
+            <span class="cta-icon" aria-hidden="true">🎙</span>
+            <span><b>AI音声受付をはじめる</b><small>マイクを使って会話します</small></span>
+          </button>
+          <button id="startChatBtn" class="secondary-cta" type="button">
+            <span aria-hidden="true">⌨</span>
+            <span>チャット入力ではじめる</span>
+          </button>
+        </div>
+
+        <div class="feature-grid" aria-label="この受付でできること">
+          <div><b>53件</b><span>正式マスターから検索</span></div>
+          <div><b>2方式</b><span>集合研修 / VOD</span></div>
+          <div><b>1項目ずつ</b><span>申込情報を確認</span></div>
+        </div>
+      </div>
+
+      <div class="landing-operator" aria-label="AI受付案内">
+        <div class="operator-stage">
+          <div class="operator-topline">
+            <span class="operator-online"><i></i> AI受付案内中</span>
+            <span class="operator-tag">公開講座専用</span>
+          </div>
+          <div class="operator-visual">
+            <img class="operator-desktop" src="assets/receptionist-desktop.png" alt="公開講座を案内するAI受付スタッフのイメージ">
+            <img class="operator-mobile" src="assets/receptionist-mobile.png" alt="公開講座を案内するAI受付スタッフのイメージ">
+          </div>
+          <div class="operator-balloon">
+            <span class="balloon-label">AI受付</span>
+            <strong>こんにちは。</strong>
+            <p>公開講座についてご案内します。</p>
+          </div>
+          <div class="operator-floor"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="receptionScreen" class="reception hidden" aria-labelledby="receptionTitle">
+      <div class="reception-layout">
+        <section class="conversation-card" aria-label="AIとの会話">
+          <div class="conversation-head">
+            <div>
+              <p class="eyebrow">AI VOICE RECEPTION</p>
+              <h2 id="receptionTitle">公開講座 AI音声受付</h2>
+            </div>
+            <button id="resetBtn" class="icon-btn" type="button" title="最初からやり直す">↺ <span>やり直す</span></button>
+          </div>
+
+          <ol id="progress" class="progress" aria-label="受付の進み具合">
+            <li data-step="search" class="active">講座を探す</li>
+            <li data-step="method">受講方法</li>
+            <li data-step="person">申込者情報</li>
+            <li data-step="confirm">確認</li>
+            <li data-step="complete">完了</li>
+          </ol>
+
+          <div id="statusBar" class="status-bar" role="status" aria-live="polite">
+            <span class="status-dot"></span>
+            <span id="statusText">受付を開始します</span>
+          </div>
+
+          <div id="messages" class="messages" aria-live="polite" aria-label="会話履歴"></div>
+          <div id="suggestions" class="suggestions" aria-live="polite"></div>
+
+          <div class="input-dock">
+            <div class="mode-tabs" role="tablist" aria-label="入力方法">
+              <button id="voiceTab" class="mode-tab active" type="button" role="tab" aria-selected="true">🎤 音声入力</button>
+              <button id="chatTab" class="mode-tab" type="button" role="tab" aria-selected="false">⌨ チャット入力</button>
+            </div>
+
+            <div id="voicePanel" class="voice-panel">
+              <button id="micBtn" class="mic-btn" type="button" aria-label="音声入力を開始">
+                <span class="mic-rings" aria-hidden="true"></span>
+                <span class="mic-symbol" aria-hidden="true">🎙</span>
+              </button>
+              <div class="voice-copy">
+                <strong id="voicePrompt">マイクを押してお話しください</strong>
+                <span id="liveTranscript">例：「第50回について知りたいです」</span>
+              </div>
+              <button id="toChatBtn" class="text-link-btn" type="button">うまくいかない場合はチャットへ</button>
+            </div>
+
+            <form id="chatPanel" class="chat-panel hidden" autocomplete="off">
+              <label class="sr-only" for="chatInput">回答を入力</label>
+              <input id="chatInput" type="text" maxlength="160" placeholder="ここに回答を入力してください">
+              <button class="send-btn" type="submit" aria-label="送信">送信</button>
+              <button id="toVoiceBtn" class="text-link-btn" type="button">🎤 音声入力に戻る</button>
+            </form>
+          </div>
+        </section>
+
+        <aside class="operator-panel" aria-label="AI受付スタッフ">
+          <div class="operator-panel-head">
+            <div class="agent-status"><span></span> AI受付案内中</div>
+            <button id="speakerBtn" class="tool-btn active" type="button" aria-pressed="true">🔊 読み上げ ON</button>
+          </div>
+
+          <div class="operator-panel-visual">
+            <img class="operator-desktop" src="assets/receptionist-desktop.png" alt="公開講座を案内するAI受付スタッフのイメージ">
+            <img class="operator-mobile" src="assets/receptionist-mobile.png" alt="公開講座を案内するAI受付スタッフのイメージ">
+            <div id="agentCaption" class="agent-caption">どのような講座をお探しですか？</div>
+          </div>
+
+          <div class="operator-panel-foot">
+            <div class="switch-note">
+              <span>⌨</span>
+              <p><strong>音声が難しいとき</strong><br>途中からチャット入力へ切り替えても、受付内容は引き継がれます。</p>
+            </div>
+            <button id="helpBtn" class="help-btn" type="button">？ 使い方を見る</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div>兵庫県立総合教育センター 公開講座専用受付</div>
+    <div class="footer-note">STEP10-1 開発・検証版：実際の受付登録はまだ行いません。</div>
+  </footer>
+
+  <dialog id="helpDialog" class="help-dialog">
+    <div class="dialog-head">
+      <h2>使い方</h2>
+      <button id="closeHelpBtn" class="icon-btn" type="button" aria-label="閉じる">×</button>
+    </div>
+    <ol>
+      <li>マイクを押して、希望する講座や内容を話します。</li>
+      <li>候補から講座を選び、集合研修またはVODを選びます。</li>
+      <li>所属・氏名・所属電話番号を1項目ずつ答えます。</li>
+      <li>最後に内容を確認して仮受付します。</li>
+    </ol>
+    <p>音声入力がうまくいかない場合は、いつでもチャット入力へ切り替えてください。</p>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="assets/deployment-config.js"></script>
+  <script src="assets/config.js"></script>
+  <script src="assets/courses.js"></script>
+  <script src="assets/core.js"></script>
+  <script src="assets/gemini-live.js"></script>
+  <script src="assets/app.js" defer></script>
+</body>
+</html>
