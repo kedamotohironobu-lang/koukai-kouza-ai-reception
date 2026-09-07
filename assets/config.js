@@ -6,12 +6,12 @@ window.APP_CONFIG = Object.freeze({
   productionEmail: 'k-open@hyogo-c.ed.jp',
   year: 'R8',
 
-  // STEP10-3でも受付登録は mock のまま維持します。
+  // STEP10-4でも受付登録は mock のまま維持します。
   // Apps Script / Google Sheets 接続は後段STEPで切り替えます。
   integrationMode: 'mock', // 'mock' | 'secure-bridge'
   bridgeEndpoint: '',
 
-  // Gemini Live 日本語音声 → 正式マスター検索接続。
+  // Gemini Live 日本語音声 → 正式マスター検索 → ハンズフリー受付フロー。
   // APIキーはブラウザへ置かず、Cloudflare Workerから短命トークンを取得します。
   geminiLive: Object.freeze({
     enabled: true,
@@ -25,8 +25,13 @@ window.APP_CONFIG = Object.freeze({
     inputSampleRate: 16000,
     outputSampleRate: 24000,
     voiceName: 'Kore',
-    fallbackToStep9Voice: true
+    fallbackToStep9Voice: true,
+    handsFreeVoice: true,
+    vadThreshold: 0.012,
+    silenceMs: 1100,
+    noSpeechMs: 8000,
+    maxUtteranceMs: 20000
   }),
 
-  environmentLabel: '開発・検証版'
+  environmentLabel: 'STEP10-4 開発・検証版'
 });

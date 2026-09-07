@@ -66,7 +66,16 @@
     geminiUserTranscript: '',
     geminiModelTranscript: '',
     geminiTranscriptCommitTimer: null,
-    geminiTranscriptCommitted: false
+    geminiTranscriptCommitted: false,
+    autoVoiceEnabled: false,
+    autoVoiceTimer: null,
+    autoVoicePromptToken: 0,
+    autoVoiceRetryCount: 0,
+    geminiCaptureStartedAt: 0,
+    geminiLastVoiceAt: 0,
+    geminiVoiceDetected: false,
+    geminiAutoStopPending: false,
+    geminiNoSpeechTimer: null
   };
 
   const STAGE_GROUP = {
@@ -78,10 +87,17 @@
     name: 'person',
     phone: 'person',
     confirm: 'confirm',
+    correction: 'confirm',
     complete: 'complete'
   };
   const GROUPS = ['search', 'method', 'person', 'confirm', 'complete'];
   const MOBILE_BREAKPOINT = 760;
+  const AUTO_VOICE_STAGES = new Set(['search', 'course', 'method', 'affiliation', 'name', 'phone', 'confirm', 'correction']);
+  const AUTO_VOICE_START_DELAY_MS = 320;
+  const DEFAULT_VAD_THRESHOLD = 0.012;
+  const DEFAULT_SILENCE_MS = 1100;
+  const DEFAULT_NO_SPEECH_MS = 8000;
+  const DEFAULT_MAX_UTTERANCE_MS = 20000;
 
   function isMobileView() {
     return window.innerWidth <= MOBILE_BREAKPOINT;
@@ -150,6 +166,8 @@
     }
     els.landing.classList.add('hidden');
     els.reception.classList.remove('hidden');
+    state.autoVoiceEnabled = mode === 'voice' && (CONFIG.geminiLive || {}).handsFreeVoice !== false;
+    state.autoVoiceRetryCount = 0;
     switchMode(mode, { silent: true });
     applyMobileModeClass(mode);
     state.stage = 'search';
@@ -176,8 +194,12 @@
     void stopGeminiAudioCapture({ sendEnd: false });
     closeGeminiLiveConnection();
     clearGeminiTranscriptCommitTimer();
+    cancelAutoVoiceTurn();
+    clearGeminiNoSpeechTimer();
+    const keepHandsFree = state.inputMode === 'voice';
     Object.assign(state, {
-      stage: 'search', selectedCourse: null, method: '', affiliation: '', name: '', phone: '', receiptNumber: '', lastSpeechFinal: '', recognitionErrors: 0, geminiLiveReady: false, geminiLiveConnecting: false, geminiLiveError: '', geminiMicStreaming: false, geminiUserTranscript: '', geminiModelTranscript: '', geminiTranscriptCommitted: false
+      stage: 'search', selectedCourse: null, method: '', affiliation: '', name: '', phone: '', receiptNumber: '', lastSpeechFinal: '', recognitionErrors: 0, geminiLiveReady: false, geminiLiveConnecting: false, geminiLiveError: '', geminiMicStreaming: false, geminiUserTranscript: '', geminiModelTranscript: '', geminiTranscriptCommitted: false,
+      autoVoiceEnabled: keepHandsFree, autoVoiceRetryCount: 0, geminiCaptureStartedAt: 0, geminiLastVoiceAt: 0, geminiVoiceDetected: false, geminiAutoStopPending: false
     });
     els.messages.innerHTML = '';
     els.suggestions.innerHTML = '';
@@ -190,6 +212,9 @@
   function switchMode(mode, options = {}) {
     state.inputMode = mode;
     const voice = mode === 'voice';
+    state.autoVoiceEnabled = voice && (CONFIG.geminiLive || {}).handsFreeVoice !== false;
+    cancelAutoVoiceTurn();
+    clearGeminiNoSpeechTimer();
     els.voiceTab.classList.toggle('active', voice);
     els.chatTab.classList.toggle('active', !voice);
     els.voiceTab.setAttribute('aria-selected', String(voice));
@@ -203,6 +228,7 @@
       setTimeout(() => els.chatInput.focus(), 30);
     } else if (state.stage !== 'landing') {
       void ensureGeminiLiveConnection();
+      if (!options.silent) scheduleAutoVoiceTurn();
     }
     applyMobileModeClass(mode);
     if (!options.silent) {
@@ -213,6 +239,9 @@
   function receiveInput(rawText) {
     const text = normalizeSpace(rawText);
     if (!text) return;
+    cancelAutoVoiceTurn();
+    clearGeminiNoSpeechTimer();
+    state.autoVoiceRetryCount = 0;
     userSay(text);
     setStatus('内容を確認しています…');
     window.setTimeout(() => routeInput(text), 180);
@@ -227,7 +256,8 @@
       case 'name': return handleName(text);
       case 'phone': return handlePhone(text);
       case 'confirm': return handleConfirm(text);
-      case 'complete': return botSay('この受付は完了しています。「やり直す」を押すと最初から開始できます。');
+      case 'correction': return handleCorrectionChoice(text);
+      case 'complete': return botSay('この受付は完了しています。「やり直す」を押すと最初から開始できます。', { autoListen: false });
       default: return handleSearch(text);
     }
   }
@@ -281,13 +311,13 @@
     renderCourseDetail(course);
 
     if (isDeadlinePast(course.deadline)) {
-      botSay(`申込締切日は ${deadlineText} です。現在は締切日を過ぎているため、この試作画面では受付を進めません。職員確認が必要です。`);
+      botSay(`申込締切日は ${deadlineText} です。現在は締切日を過ぎているため、この試作画面では受付を進めません。職員確認が必要です。`, { autoListen: false });
       setStatus('申込締切日を過ぎています', 'warning');
       return;
     }
 
     if (!methods.length) {
-      botSay('この講座は現在選択できる受講方法がありません。別の講座をお選びください。');
+      botSay('この講座は現在選択できる受講方法がありません。別の講座をお選びください。', { autoListen: false });
       setStatus('受講方法を選択できません', 'warning');
       return;
     }
@@ -334,31 +364,33 @@
   }
 
   function handleAffiliation(text) {
-    if (text.length < 2) {
+    const value = cleanSpokenField(text, ['所属', '学校名', '勤務先']);
+    if (value.length < 2) {
       botSay('所属名をもう一度お知らせください。');
       return;
     }
-    state.affiliation = text;
+    state.affiliation = value;
     state.stage = 'name';
-    botSay(`所属は「${text}」ですね。次に、お名前をお知らせください。`);
+    botSay(`所属は「${value}」ですね。次に、お名前をお知らせください。`);
     setStatus('氏名をお話しください');
   }
 
   function handleName(text) {
-    if (text.length < 2) {
+    const value = cleanSpokenField(text, ['名前', '氏名', 'お名前']);
+    if (value.length < 2) {
       botSay('お名前をもう一度お知らせください。');
       return;
     }
-    state.name = text;
+    state.name = value;
     state.stage = 'phone';
-    botSay(`お名前は「${text}」ですね。最後に、所属の電話番号をお知らせください。`);
+    botSay(`お名前は「${value}」ですね。最後に、所属の電話番号を、ゆっくり数字でお知らせください。`);
     setStatus('所属電話番号をお話しください');
   }
 
   function handlePhone(text) {
-    const phone = normalizePhone(text);
+    const phone = normalizeSpokenPhone(text);
     if (phone.length < 8 || phone.length > 15) {
-      botSay('電話番号を確認できませんでした。数字で、所属の電話番号をもう一度お知らせください。');
+      botSay('電話番号を確認できませんでした。「ゼロ・ナナ・キュウ…」のように、所属の電話番号をゆっくりもう一度お知らせください。');
       return;
     }
     state.phone = formatPhoneDisplay(phone);
@@ -372,15 +404,52 @@
 
   function handleConfirm(text) {
     const normalized = normalizeForSearch(text);
-    if (/^(はい|ok|オーケー|お願いします|これで|正しい)/.test(normalized)) {
+    if (/^(はい|ok|オーケー|お願いします|これで|正しい|大丈夫|よい|いい)/.test(normalized)) {
       return completeReception();
     }
     if (normalized.includes('修正') || normalized.includes('変更') || normalized.includes('違')) {
+      state.stage = 'correction';
+      updateProgress();
       renderCorrectionChoices();
-      botSay('修正する項目を選んでください。');
+      botSay('修正する項目を、「講座」「受講方法」「所属」「氏名」「電話番号」のいずれかでお知らせください。');
       return;
     }
     botSay('内容が正しければ「はい」、変更する場合は「修正」とお知らせください。');
+  }
+
+  function handleCorrectionChoice(text) {
+    const normalized = normalizeForSearch(text);
+    if (normalized.includes('講座')) return beginCorrection('course');
+    if (normalized.includes('受講') || normalized.includes('方法') || normalized.includes('集合') || normalized.includes('vod')) return beginCorrection('method');
+    if (normalized.includes('所属') || normalized.includes('学校')) return beginCorrection('affiliation');
+    if (normalized.includes('氏名') || normalized.includes('名前')) return beginCorrection('name');
+    if (normalized.includes('電話') || normalized.includes('連絡先')) return beginCorrection('phone');
+    botSay('修正する項目を、「講座」「受講方法」「所属」「氏名」「電話番号」のいずれかでお知らせください。');
+  }
+
+  function beginCorrection(target) {
+    els.suggestions.innerHTML = '';
+    if (target === 'course') {
+      state.stage = 'search';
+      state.selectedCourse = null;
+      state.method = '';
+      botSay('講座を選び直します。希望する講座をお知らせください。');
+      showSearchExamples();
+    } else if (target === 'method') {
+      state.stage = 'method';
+      botSay('受講方法を選び直します。「集合研修」または「VOD」とお知らせください。');
+      renderMethodChoices(state.selectedCourse);
+    } else if (target === 'affiliation') {
+      state.stage = 'affiliation';
+      botSay('所属をもう一度お知らせください。');
+    } else if (target === 'name') {
+      state.stage = 'name';
+      botSay('お名前をもう一度お知らせください。');
+    } else if (target === 'phone') {
+      state.stage = 'phone';
+      botSay('所属の電話番号をもう一度お知らせください。');
+    }
+    updateProgress();
   }
 
   async function completeReception() {
@@ -528,17 +597,19 @@
   }
 
   function renderCorrectionChoices() {
+    state.stage = 'correction';
+    updateProgress();
     els.suggestions.innerHTML = '';
     const row = document.createElement('div');
     row.className = 'chip-row';
     const choices = [
-      ['講座', () => { state.stage = 'search'; state.selectedCourse = null; state.method = ''; botSay('講座を選び直します。希望する講座をお知らせください。'); showSearchExamples(); }],
-      ['受講方法', () => { state.stage = 'method'; botSay('受講方法を選び直します。'); renderMethodChoices(state.selectedCourse); }],
-      ['所属', () => { state.stage = 'affiliation'; botSay('所属をもう一度お知らせください。'); }],
-      ['氏名', () => { state.stage = 'name'; botSay('お名前をもう一度お知らせください。'); }],
-      ['電話番号', () => { state.stage = 'phone'; botSay('所属の電話番号をもう一度お知らせください。'); }]
+      ['講座', 'course'],
+      ['受講方法', 'method'],
+      ['所属', 'affiliation'],
+      ['氏名', 'name'],
+      ['電話番号', 'phone']
     ];
-    choices.forEach(([label, fn]) => row.append(makeChip(label, () => { els.suggestions.innerHTML = ''; fn(); updateProgress(); })));
+    choices.forEach(([label, target]) => row.append(makeChip(label, () => beginCorrection(target))));
     els.suggestions.append(row);
   }
 
@@ -617,7 +688,19 @@
     addMessage('bot', text);
     const firstLine = text.split('\n')[0];
     els.agentCaption.textContent = firstLine.length > 84 ? `${firstLine.slice(0, 84)}…` : firstLine;
-    if (state.speakerOn && !options.silent) speak(text);
+
+    const promptToken = ++state.autoVoicePromptToken;
+    const shouldListen = !options.silent && options.autoListen !== false && shouldAutoVoiceListen();
+    if (state.speakerOn && !options.silent) {
+      const spoken = speak(text, {
+        onEnd: () => {
+          if (shouldListen) scheduleAutoVoiceTurn(promptToken);
+        }
+      });
+      if (!spoken && shouldListen) scheduleAutoVoiceTurn(promptToken);
+    } else if (shouldListen) {
+      scheduleAutoVoiceTurn(promptToken);
+    }
   }
 
   function userSay(text) { addMessage('user', text); }
@@ -633,17 +716,81 @@
     requestAnimationFrame(() => { els.messages.scrollTop = els.messages.scrollHeight; });
   }
 
-  function speak(text) {
-    if (!('speechSynthesis' in window) || !state.speakerOn) return;
+  function speak(text, options = {}) {
+    if (!('speechSynthesis' in window) || !state.speakerOn) return false;
     try {
       speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text.replace(/\n/g, ' '));
       utterance.lang = 'ja-JP';
       utterance.rate = 1.03;
       utterance.pitch = 1.0;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (typeof options.onEnd === 'function') options.onEnd();
+      };
+      utterance.onend = finish;
+      utterance.onerror = finish;
       speechSynthesis.speak(utterance);
+      return true;
     } catch (err) {
       console.warn('音声読み上げを利用できません。画面表示は継続します。', err);
+      return false;
+    }
+  }
+
+  function shouldAutoVoiceListen() {
+    return Boolean(
+      state.autoVoiceEnabled &&
+      state.inputMode === 'voice' &&
+      state.stage !== 'landing' &&
+      state.stage !== 'complete' &&
+      AUTO_VOICE_STAGES.has(state.stage)
+    );
+  }
+
+  function cancelAutoVoiceTurn() {
+    if (state.autoVoiceTimer) {
+      window.clearTimeout(state.autoVoiceTimer);
+      state.autoVoiceTimer = null;
+    }
+  }
+
+  function scheduleAutoVoiceTurn(promptToken = state.autoVoicePromptToken, delayMs = AUTO_VOICE_START_DELAY_MS) {
+    if (promptToken !== state.autoVoicePromptToken) return;
+    cancelAutoVoiceTurn();
+    if (!shouldAutoVoiceListen()) return;
+    state.autoVoiceTimer = window.setTimeout(() => {
+      state.autoVoiceTimer = null;
+      void beginAutoVoiceTurn(promptToken);
+    }, delayMs);
+  }
+
+  async function beginAutoVoiceTurn(promptToken) {
+    if (promptToken !== state.autoVoicePromptToken || !shouldAutoVoiceListen()) return;
+    if (state.geminiMicStreaming || state.recognizing) return;
+    if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) {
+      scheduleAutoVoiceTurn(promptToken, 180);
+      return;
+    }
+
+    const liveConfig = CONFIG.geminiLive || {};
+    if (liveConfig.enabled && state.geminiLive) {
+      await ensureGeminiLiveConnection();
+      if (promptToken !== state.autoVoicePromptToken || !shouldAutoVoiceListen()) return;
+      if (state.geminiLiveReady && state.geminiLive?.isReady()) {
+        try {
+          await startGeminiAudioCapture();
+          return;
+        } catch (error) {
+          console.warn('[Gemini Live] ハンズフリー音声入力開始失敗', error);
+        }
+      }
+    }
+
+    if (speechRecognitionAvailable()) {
+      try { state.recognition.start(); } catch (error) { console.warn(error); }
     }
   }
 
@@ -767,6 +914,8 @@
 
     state.geminiTranscriptCommitted = true;
     clearGeminiTranscriptCommitTimer();
+    clearGeminiNoSpeechTimer();
+    state.autoVoiceRetryCount = 0;
     stopGeminiOutputAudio();
     state.geminiUserTranscript = '';
     state.geminiModelTranscript = '';
@@ -816,6 +965,7 @@
   }
 
   async function toggleVoiceInput() {
+    cancelAutoVoiceTurn();
     if (!window.isSecureContext) {
       botSay('マイクを使うため、HTTPSまたは localhost から開いてください。チャット入力はそのまま利用できます。', { silent: true });
       switchMode('chat', { silent: true });
@@ -880,14 +1030,40 @@
     processor.connect(sink);
     sink.connect(audioContext.destination);
 
-    const targetRate = Number((CONFIG.geminiLive || {}).inputSampleRate) || 16000;
+    const liveConfig = CONFIG.geminiLive || {};
+    const targetRate = Number(liveConfig.inputSampleRate) || 16000;
+    const vadThreshold = Number(liveConfig.vadThreshold) || DEFAULT_VAD_THRESHOLD;
+    const silenceMs = Number(liveConfig.silenceMs) || DEFAULT_SILENCE_MS;
+    const noSpeechMs = Number(liveConfig.noSpeechMs) || DEFAULT_NO_SPEECH_MS;
+    const maxUtteranceMs = Number(liveConfig.maxUtteranceMs) || DEFAULT_MAX_UTTERANCE_MS;
+
     processor.onaudioprocess = (event) => {
       if (!state.geminiMicStreaming || !state.geminiLive?.isReady()) return;
       const input = event.inputBuffer.getChannelData(0);
+      const now = performance.now();
+      let sumSquares = 0;
+      for (let i = 0; i < input.length; i += 1) sumSquares += input[i] * input[i];
+      const rms = Math.sqrt(sumSquares / Math.max(1, input.length));
+      if (rms >= vadThreshold) {
+        state.geminiVoiceDetected = true;
+        state.geminiLastVoiceAt = now;
+      }
+
       const resampled = resampleFloat32(input, audioContext.sampleRate, targetRate);
-      if (!resampled.length) return;
-      const pcm16 = float32ToPcm16(resampled);
-      state.geminiLive.sendAudioPcmBase64(arrayBufferToBase64(pcm16.buffer), targetRate);
+      if (resampled.length) {
+        const pcm16 = float32ToPcm16(resampled);
+        state.geminiLive.sendAudioPcmBase64(arrayBufferToBase64(pcm16.buffer), targetRate);
+      }
+
+      if (!state.autoVoiceEnabled || state.geminiAutoStopPending) return;
+      const elapsed = now - state.geminiCaptureStartedAt;
+      if (state.geminiVoiceDetected && state.geminiLastVoiceAt && (now - state.geminiLastVoiceAt) >= silenceMs && elapsed >= 900) {
+        requestGeminiAutoStop('silence');
+      } else if (!state.geminiVoiceDetected && elapsed >= noSpeechMs) {
+        requestGeminiAutoStop('no-speech');
+      } else if (elapsed >= maxUtteranceMs) {
+        requestGeminiAutoStop('max-duration');
+      }
     };
 
     state.geminiMediaStream = mediaStream;
@@ -897,15 +1073,54 @@
     state.geminiInputSink = sink;
     state.geminiMicStreaming = true;
     clearGeminiTranscriptCommitTimer();
+    clearGeminiNoSpeechTimer();
     state.geminiUserTranscript = '';
     state.geminiModelTranscript = '';
     state.geminiTranscriptCommitted = false;
+    state.geminiCaptureStartedAt = performance.now();
+    state.geminiLastVoiceAt = 0;
+    state.geminiVoiceDetected = false;
+    state.geminiAutoStopPending = false;
 
     els.mic.classList.add('listening');
     els.statusBar.classList.add('listening');
-    els.voicePrompt.textContent = 'お話しください（もう一度押すと終了）';
+    els.voicePrompt.textContent = state.autoVoiceEnabled ? 'お話しください（話し終えると自動で確定します）' : 'お話しください（もう一度押すと終了）';
     els.liveTranscript.textContent = '日本語音声をGemini Liveへ送信しています';
     setStatus('Gemini Liveで音声を聞き取っています');
+  }
+
+  function requestGeminiAutoStop(reason) {
+    if (!state.geminiMicStreaming || state.geminiAutoStopPending) return;
+    state.geminiAutoStopPending = true;
+    window.setTimeout(() => {
+      if (!state.geminiMicStreaming) {
+        state.geminiAutoStopPending = false;
+        return;
+      }
+      void stopGeminiAudioCapture({ sendEnd: true, reason });
+    }, 0);
+  }
+
+  function clearGeminiNoSpeechTimer() {
+    if (state.geminiNoSpeechTimer) {
+      window.clearTimeout(state.geminiNoSpeechTimer);
+      state.geminiNoSpeechTimer = null;
+    }
+  }
+
+  function scheduleNoSpeechRecovery() {
+    clearGeminiNoSpeechTimer();
+    state.geminiNoSpeechTimer = window.setTimeout(() => {
+      state.geminiNoSpeechTimer = null;
+      if (state.geminiTranscriptCommitted || normalizeSpace(state.geminiUserTranscript)) return;
+      state.autoVoiceRetryCount += 1;
+      if (state.autoVoiceRetryCount <= 2 && shouldAutoVoiceListen()) {
+        botSay('音声を確認できませんでした。もう一度、少しゆっくりお話しください。');
+      } else {
+        botSay('音声を確認できませんでした。マイクボタンを押して再度お話しいただくか、チャット入力へ切り替えてください。', { autoListen: false });
+        setStatus('音声を確認できませんでした', 'warning');
+      }
+    }, 1800);
   }
 
   async function stopGeminiAudioCapture(options = {}) {
@@ -934,6 +1149,7 @@
     state.geminiInputSource = null;
     state.geminiInputProcessor = null;
     state.geminiInputSink = null;
+    state.geminiAutoStopPending = false;
 
     els.mic.classList.remove('listening');
     els.statusBar.classList.remove('listening');
@@ -945,6 +1161,7 @@
         els.liveTranscript.textContent = state.geminiUserTranscript || '音声を文字にしています…';
         setStatus('音声を確定しています…');
         if (state.geminiUserTranscript) scheduleGeminiTranscriptCommit();
+        if (options.reason === 'no-speech') scheduleNoSpeechRecovery();
       } else {
         els.liveTranscript.textContent = 'Geminiの返答を待っています…';
         setStatus('Geminiが返答しています…');
@@ -1046,6 +1263,8 @@
 
   function closeGeminiLiveConnection() {
     clearGeminiTranscriptCommitTimer();
+    clearGeminiNoSpeechTimer();
+    cancelAutoVoiceTurn();
     stopGeminiOutputAudio();
     if (state.geminiLive) state.geminiLive.close();
     state.geminiLiveReady = false;
@@ -1162,6 +1381,42 @@
     els.toast.classList.add('show');
     clearTimeout(showToast.timer);
     showToast.timer = setTimeout(() => els.toast.classList.remove('show'), 2600);
+  }
+
+  function cleanSpokenField(value, labels = []) {
+    let text = normalizeSpace(value);
+    for (const label of labels) {
+      text = text.replace(new RegExp(`^(?:私の)?${label}(?:は|が)?\s*`, 'i'), '');
+    }
+    return text
+      .replace(/(?:です|でございます|になります)[。．.!！]?$/u, '')
+      .replace(/[。．.!！]+$/u, '')
+      .trim();
+  }
+
+  function normalizeSpokenPhone(value) {
+    let text = String(value || '').normalize('NFKC').toLowerCase();
+    text = text
+      .replace(/(?:所属の)?電話番号(?:は|が)?/g, '')
+      .replace(/連絡先(?:は|が)?/g, '')
+      .replace(/番号(?:は|が)?/g, '')
+      .replace(/(?:です|になります|です。|お願いします)/g, '')
+      .replace(/ハイフン|マイナス|の/g, ' ');
+
+    const digitWords = [
+      ['ゼロ', '0'], ['れい', '0'], ['レイ', '0'], ['まる', '0'], ['マル', '0'],
+      ['いち', '1'], ['イチ', '1'],
+      ['に', '2'], ['ニ', '2'],
+      ['さん', '3'], ['サン', '3'],
+      ['よん', '4'], ['ヨン', '4'],
+      ['ご', '5'], ['ゴ', '5'],
+      ['ろく', '6'], ['ロク', '6'],
+      ['なな', '7'], ['ナナ', '7'], ['しち', '7'], ['シチ', '7'],
+      ['はち', '8'], ['ハチ', '8'],
+      ['きゅう', '9'], ['キュウ', '9'], ['きゅー', '9'], ['キュー', '9']
+    ];
+    for (const [word, digit] of digitWords) text = text.split(word).join(digit);
+    return normalizePhone(text);
   }
 
   function normalizeForSearch(value) { return CORE.normalizeForSearch(value); }
