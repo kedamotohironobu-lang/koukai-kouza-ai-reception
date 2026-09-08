@@ -9,6 +9,9 @@
       this.tokenEndpoint = options.tokenEndpoint || '';
       this.wsBase = options.wsBase || DEFAULT_WS_BASE;
       this.voiceName = options.voiceName || 'Kore';
+      this.customInstruction = options.systemInstruction;
+      this.tools = options.tools;
+      this.realtimeInputConfig = options.realtimeInputConfig;
       this.onStatus = typeof options.onStatus === 'function' ? options.onStatus : () => {};
       this.onMessage = typeof options.onMessage === 'function' ? options.onMessage : () => {};
       this.socket = null;
@@ -66,6 +69,8 @@
             socket.send(JSON.stringify({
               setup: {
                 model: `models/${this.model}`,
+                ...(this.tools ? {tools:this.tools} : {}),
+                ...(this.realtimeInputConfig ? {realtimeInputConfig:this.realtimeInputConfig} : {}),
                 generationConfig: {
                   responseModalities: ['AUDIO'],
                   speechConfig: {
@@ -78,7 +83,7 @@
                 outputAudioTranscription: {},
                 systemInstruction: {
                   parts: [{
-                    text: [
+                    text: this.customInstruction || [
                       'あなたは兵庫県立総合教育センター公開講座AI音声受付の音声入力セッションです。',
                       'STEP10-4では利用者の日本語発話を正確に文字起こしすることを最優先にしてください。',
                       '公開講座の具体的内容、日程、講師、申込可否などを推測・生成してはいけません。',
@@ -129,6 +134,18 @@
           }
         };
       });
+    }
+
+    sendText(text) {
+      if (!this.isReady()) return false;
+      this.socket.send(JSON.stringify({realtimeInput:{text:String(text)}}));
+      return true;
+    }
+
+    sendToolResponses(functionResponses) {
+      if (!this.isReady()) return false;
+      this.socket.send(JSON.stringify({toolResponse:{functionResponses}}));
+      return true;
     }
 
     sendAudioPcmBase64(base64Data, sampleRate = 16000) {

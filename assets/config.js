@@ -6,15 +6,18 @@ window.APP_CONFIG = Object.freeze({
   productionEmail: 'k-open@hyogo-c.ed.jp',
   year: 'R8',
 
-  // STEP10-4でも受付登録は mock のまま維持します。
-  // Apps Script / Google Sheets 接続は後段STEPで切り替えます。
-  integrationMode: 'mock', // 'mock' | 'secure-bridge'
-  bridgeEndpoint: '',
+  // STEP10-5: Cloudflare Worker経由でApps Script / Google Sheetsへ仮受付を実登録します。
+  // Apps Script WebアプリURLや共有シークレットはGitHubへ置かず、Cloudflare Secretで保持します。
+  integrationMode: 'secure-bridge', // 'mock' | 'secure-bridge'
+  bridgeEndpoint: window.DEPLOYMENT_CONFIG?.receptionSubmitEndpoint || '',
+  confirmationEmailEnabled: false,
 
-  // Gemini Live 日本語音声 → 正式マスター検索 → ハンズフリー受付フロー。
+  // naturalConversation:true は自然会話モジュールを使用します。
+  // routeInputToReception/suppressModelOutput/silenceMs 以下は従来方式へ戻した場合の設定です。
   // APIキーはブラウザへ置かず、Cloudflare Workerから短命トークンを取得します。
   geminiLive: Object.freeze({
     enabled: true,
+    naturalConversation: true,
     model: 'gemini-3.1-flash-live-preview',
     tokenEndpoint: window.DEPLOYMENT_CONFIG?.geminiTokenEndpoint || '',
     apiVersion: 'v1beta',
@@ -33,5 +36,5 @@ window.APP_CONFIG = Object.freeze({
     maxUtteranceMs: 20000
   }),
 
-  environmentLabel: 'STEP10-4 開発・検証版'
+  environmentLabel: 'STEP10-5N 自然会話・検証版'
 });

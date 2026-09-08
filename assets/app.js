@@ -35,6 +35,12 @@
     toast: $('#toast')
   };
 
+  let natural = null;
+  let submissionPromise = null;
+  let submissionIdentity = null;
+  let submissionResult = null;
+  const naturalMode = () => CONFIG.geminiLive?.naturalConversation === true && state.inputMode === 'voice';
+
   const state = {
     stage: 'landing',
     inputMode: 'voice',
@@ -126,7 +132,8 @@
       showToast('講座データの読み込みに失敗しました。');
     }
     initSpeechRecognition();
-    initGeminiLiveBridge();
+    if (!CONFIG.geminiLive?.naturalConversation) initGeminiLiveBridge();
+    window.addEventListener('beforeunload',()=>natural?.stop());
     applyMobileModeClass();
     window.addEventListener('resize', () => applyMobileModeClass());
   }
@@ -153,7 +160,7 @@
       els.speaker.setAttribute('aria-pressed', String(state.speakerOn));
       els.speaker.textContent = state.speakerOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
       if (!state.speakerOn && 'speechSynthesis' in window) speechSynthesis.cancel();
-      if (!state.speakerOn) stopGeminiOutputAudio();
+      if (!state.speakerOn) {stopGeminiOutputAudio(); natural?.stopOutput();}
     });
     els.help.addEventListener('click', () => els.helpDialog.showModal());
     els.closeHelp.addEventListener('click', () => els.helpDialog.close());
@@ -174,6 +181,7 @@
     updateProgress();
     els.messages.innerHTML = '';
     els.suggestions.innerHTML = '';
+    if (naturalMode()) {showSearchExamples();void startNatural();return;}
     botSay('こんにちは。兵庫県立総合教育センターの公開講座をご案内します。\n第何回の講座か、または「生成AI」「不登校」のように学びたい内容をお話しください。');
     showSearchExamples();
     setStatus('希望する講座をお話しください');
@@ -189,6 +197,8 @@
   }
 
   function resetReception() {
+    if (submissionPromise || (submissionIdentity && !submissionResult)) {showToast('登録結果が未確認です。同じ内容で再試行してからやり直してください。');return;}
+    natural?.stop(); natural=null; submissionIdentity=null; submissionResult=null;
     if ('speechSynthesis' in window) speechSynthesis.cancel();
     stopRecognition();
     void stopGeminiAudioCapture({ sendEnd: false });
@@ -203,6 +213,7 @@
     });
     els.messages.innerHTML = '';
     els.suggestions.innerHTML = '';
+    if(naturalMode()){showSearchExamples();updateProgress();void startNatural();return;}
     botSay('最初からやり直します。\n第何回の講座か、学びたい内容をお話しください。');
     showSearchExamples();
     updateProgress();
@@ -222,11 +233,13 @@
     els.voicePanel.classList.toggle('hidden', !voice);
     els.chatPanel.classList.toggle('hidden', voice);
     if (!voice) {
+      natural?.stop();
       stopRecognition();
       void stopGeminiAudioCapture({ sendEnd: false });
       closeGeminiLiveConnection();
       setTimeout(() => els.chatInput.focus(), 30);
     } else if (state.stage !== 'landing') {
+      if(naturalMode()) {void startNatural();applyMobileModeClass(mode);return;}
       void ensureGeminiLiveConnection();
       if (!options.silent) scheduleAutoVoiceTurn();
     }
@@ -237,8 +250,10 @@
   }
 
   function receiveInput(rawText) {
+    if(!naturalMode() && submissionIdentity && !submissionResult){if(/^(はい|再試行|お願いします)[。!！\s]*$/.test(String(rawText).trim())){state.stage='confirm';void completeReception();}else showToast('登録結果が未確認です。同じ内容で再試行してください。');return;}
     const text = normalizeSpace(rawText);
     if (!text) return;
+    if(naturalMode()){natural?.send(text);return;}
     cancelAutoVoiceTurn();
     clearGeminiNoSpeechTimer();
     state.autoVoiceRetryCount = 0;
@@ -295,6 +310,7 @@
   }
 
   function selectCourse(key) {
+    if(naturalMode()){natural?.send('画面で講座 '+key+' を選びました。正式マスターで確認し下書きに反映してください。');return;}
     const course = state.courses.find((item) => item.key === key);
     if (!course) return;
     state.selectedCourse = course;
@@ -345,6 +361,7 @@
   }
 
   function chooseMethod(method) {
+    if(naturalMode()){natural?.send('受講方法は '+method+' を希望します。');return;}
     const c = state.selectedCourse;
     if (!c) return;
     if (method === '集合研修' && !c.onsiteAvailable) {
@@ -428,6 +445,7 @@
   }
 
   function beginCorrection(target) {
+    if(naturalMode()){natural?.send(target+' を修正したいです。');return;}
     els.suggestions.innerHTML = '';
     if (target === 'course') {
       state.stage = 'search';
@@ -453,31 +471,79 @@
   }
 
   async function completeReception() {
-    setStatus('仮受付内容を作成しています…');
-    try {
-      const result = await submitReception();
-      state.receiptNumber = result.receiptNumber;
-      state.stage = 'complete';
-      updateProgress();
-      els.suggestions.innerHTML = '';
-      botSay('仮受付内容の作成が完了しました。');
-      renderCompletion(result);
-      setStatus(CONFIG.integrationMode === 'mock' ? 'STEP9画面テスト完了（実登録なし）' : '仮受付が完了しました');
-    } catch (err) {
-      console.error(err);
-      botSay('仮受付処理でエラーが発生しました。入力内容は送信されていません。');
-      setStatus('仮受付処理エラー', 'error');
+    if(naturalMode()) {
+      if(!natural) return;
+      const result=await natural.submit();
+      if(!result.ok) {setStatus(result.error,'error');addMessage('bot',result.error);}
+      else natural.send('システム通知：仮受付登録結果 '+JSON.stringify(result)+' 。この結果に基づいて短く案内してください。');
+      return;
     }
+    if(state.stage!=='confirm' && !submissionResult) return;
+    try {await registerCurrentReception();}
+    catch (_) {botSay('登録結果を確認できませんでした。登録済みの可能性があります。同じ内容で再試行してください。');setStatus('登録結果未確認','error');}
+  }
+
+  async function registerCurrentReception() {
+    if(submissionResult) return submissionResult;
+    if(submissionPromise) return submissionPromise;
+    setStatus('仮受付を登録しています…');
+    submissionPromise=(async()=>{
+      const result=await submitReception();
+      submissionResult=result;
+      state.receiptNumber=result.receiptNumber;state.stage='complete';updateProgress();renderCompletion(result);
+      setStatus('仮受付を登録しました（メール送信・受講確定は別途）');
+      if(!naturalMode())botSay('仮受付を登録しました。受付番号をご確認ください。',{autoListen:false});
+      return result;
+    })();
+    try{return await submissionPromise;}finally{submissionPromise=null;}
+  }
+
+  async function startNatural() {
+    if(natural?.active || submissionPromise || state.stage==='complete')return;
+    // A disconnected session reuses the draft, including an uncertain submission lock.
+    const previous=natural?.draft?.locked ? natural.draft : null;
+    natural?.stop();
+    natural=new window.NaturalReception({
+      courses:state.courses,core:CORE,config:CONFIG.geminiLive,
+      results:rows=>renderCourseCards(rows),
+      status:t=>setStatus(t),speaker:()=>state.speakerOn,
+      caption:t=>{els.liveTranscript.textContent=t;els.agentCaption.textContent=t.slice(-120);},
+      message:(role,t)=>addMessage(role==='user'?'user':'bot',t),
+      draft:(d,confirm)=>{
+        state.selectedCourse=d.course;state.method=d.method;state.affiliation=d.affiliation;state.name=d.name;state.phone=d.phone;
+        state.stage=confirm?'confirm':(d.missing[0]==='courseKey'?'search':d.missing[0]||'confirm');
+        updateProgress();
+        if(confirm)renderConfirmation();
+        else {els.suggestions.innerHTML='';if(d.course){renderCourseDetail(d.course);if(!d.method)renderMethodChoices(d.course);}}
+      },
+      submit:async d=>{state.selectedCourse=d.course;state.method=d.method;state.affiliation=d.affiliation;state.name=d.name;state.phone=d.phone;return registerCurrentReception();}
+    });
+    if(previous)natural.draft=previous;
+    els.mic.classList.add('listening');els.voicePrompt.textContent='会話中です（マイクを押すと一時停止）';
+    await natural.start(previous?null:{courseKey:state.selectedCourse?.key||'',method:state.method,affiliation:state.affiliation,name:state.name,phone:state.phone});
+    if(!natural.active)els.mic.classList.remove('listening');
   }
 
   async function submitReception() {
+    const course = state.selectedCourse;
+    if (!course) throw new Error('講座が選択されていません');
+
+    const fingerprint=JSON.stringify([course.key,state.method,state.affiliation,state.name,state.phone]);
+    if(submissionIdentity && submissionIdentity.fingerprint!==fingerprint)throw new Error('前回の登録結果が未確認です。元の内容で確認してください。');
+    if(!submissionIdentity)submissionIdentity={fingerprint,requestId:createReceptionRequestId()};
+    const requestId = submissionIdentity.requestId;
     const payload = {
+      purpose: 'public-course-reception-step10-5',
+      requestId,
       channel: state.inputMode === 'voice' ? 'Web音声' : 'Webチャット',
       affiliation: state.affiliation,
       name: state.name,
       phone: state.phone,
-      courseKey: state.selectedCourse.key,
-      displayCourse: state.selectedCourse.display,
+      courseKey: course.key,
+      displayCourse: course.display,
+      courseNumber: course.number,
+      courseBranch: course.branch ?? '',
+      title: course.title,
       method: state.method
     };
 
@@ -493,14 +559,43 @@
 
     if (!CONFIG.bridgeEndpoint) throw new Error('安全な中継APIが未設定です');
     const response = await fetch(CONFIG.bridgeEndpoint, {
+      signal: AbortSignal.timeout(45000),
       method: 'POST',
+      mode: 'cors',
+      cache: 'no-store',
+      credentials: 'omit',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!response.ok) throw new Error(`受付API HTTP ${response.status}`);
-    const data = await response.json();
-    if (!data || !data.ok || !data.receiptNumber) throw new Error('受付APIから正常な受付番号を取得できませんでした');
+
+    let data = null;
+    try { data = await response.json(); } catch (_) { /* noop */ }
+    if (!response.ok || !data?.ok || !data?.receiptNumber) {
+      const code = data?.code || `HTTP_${response.status}`;
+      throw new Error(receptionErrorMessage(code));
+    }
     return data;
+  }
+
+  function createReceptionRequestId() {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+    return `req-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  }
+
+  function receptionErrorMessage(code) {
+    const messages = {
+      ORIGIN_NOT_ALLOWED: '受付サイトからの通信として確認できませんでした',
+      INVALID_PURPOSE: '受付APIの要求形式を確認できませんでした',
+      INVALID_RECEPTION_DATA: '受付内容に不足または不正な値があります',
+      COURSE_NOT_FOUND: '正式マスターで講座を確認できませんでした',
+      METHOD_NOT_AVAILABLE: '正式マスターでは、その受講方法を選択できません',
+      DEADLINE_PASSED: '申込締切日を過ぎているため仮受付できません',
+      APPS_SCRIPT_NOT_CONFIGURED: 'Apps Script接続設定が完了していません',
+      APPS_SCRIPT_AUTH_FAILED: 'Apps Scriptとの安全な接続を確認できませんでした',
+      APPS_SCRIPT_REJECTED: 'Apps Scriptで仮受付を完了できませんでした',
+      APPS_SCRIPT_NETWORK_ERROR: 'Apps Scriptとの通信でエラーが発生しました'
+    };
+    return messages[code] || `受付APIでエラーが発生しました（${code}）`;
   }
 
   function searchCourses(query) {
@@ -557,6 +652,7 @@
         </div>
       </div>`;
     $('#backSearchBtn')?.addEventListener('click', () => {
+      if(naturalMode()){natural.armed=false;natural.draft.prepared=null;natural.send('別の講座を探したいです。');return;}
       state.selectedCourse = null;
       state.stage = 'search';
       updateProgress();
@@ -593,10 +689,11 @@
         </div>
       </div>`;
     $('#confirmYesBtn')?.addEventListener('click', completeReception);
-    $('#confirmEditBtn')?.addEventListener('click', renderCorrectionChoices);
+    $('#confirmEditBtn')?.addEventListener('click', () => {if(naturalMode()){natural.armed=false;natural.draft.prepared=null;natural.send('内容を修正したいです。どの項目か聞いてください。');}else renderCorrectionChoices();});
   }
 
   function renderCorrectionChoices() {
+    if(naturalMode()){natural.armed=false;natural.draft.prepared=null;natural.send('申込内容を修正したいです。');return;}
     state.stage = 'correction';
     updateProgress();
     els.suggestions.innerHTML = '';
@@ -616,7 +713,7 @@
   function renderCompletion(result) {
     const c = state.selectedCourse;
     const draft = buildEmailDraft(result.receiptNumber);
-    const emailEnabled = CONFIG.integrationMode === 'secure-bridge' && !result.mock;
+    const emailEnabled = CONFIG.confirmationEmailEnabled === true && CONFIG.integrationMode === 'secure-bridge' && !result.mock;
 
     els.suggestions.innerHTML = `
       <div class="complete-card">
@@ -628,7 +725,7 @@
         <div class="email-draft">${escapeHtml(draft)}</div>
         <div class="detail-actions" style="justify-content:center">
           <button id="copyDraftBtn" class="action-btn secondary" type="button">確認メール文面をコピー</button>
-          <button id="openMailBtn" class="action-btn primary" type="button" ${emailEnabled ? '' : 'disabled'}>${emailEnabled ? 'メールアプリを開く' : 'STEP10～11でメール連携'}</button>
+          <button id="openMailBtn" class="action-btn primary" type="button" ${emailEnabled ? '' : 'disabled'}>${emailEnabled ? 'メールアプリを開く' : 'STEP10-6で確認メール連携'}</button>
         </div>
       </div>`;
 
@@ -657,7 +754,8 @@
       `受付番号：${receipt}`,
       `所属：${state.affiliation}`,
       `氏名：${state.name}`,
-      `希望講座：${state.selectedCourse.display}`,
+      `所属電話番号：${state.phone}`,
+      `希望講座：${state.selectedCourse.display} ${state.selectedCourse.title}`,
       `受講方法：${state.method}`
     ].join('\n');
   }
@@ -685,6 +783,7 @@
   }
 
   function botSay(text, options = {}) {
+    if(naturalMode()){addMessage('bot',text);return;}
     addMessage('bot', text);
     const firstLine = text.split('\n')[0];
     els.agentCaption.textContent = firstLine.length > 84 ? `${firstLine.slice(0, 84)}…` : firstLine;
@@ -965,6 +1064,7 @@
   }
 
   async function toggleVoiceInput() {
+    if(naturalMode()){if(!natural?.active){void startNatural();return;}const on=natural.toggleMic();els.mic.classList.toggle('listening',on);return;}
     cancelAutoVoiceTurn();
     if (!window.isSecureContext) {
       botSay('マイクを使うため、HTTPSまたは localhost から開いてください。チャット入力はそのまま利用できます。', { silent: true });
