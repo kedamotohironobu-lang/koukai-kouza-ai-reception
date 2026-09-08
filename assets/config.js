@@ -10,7 +10,7 @@ window.APP_CONFIG = Object.freeze({
   // Apps Script WebアプリURLや共有シークレットはGitHubへ置かず、Cloudflare Secretで保持します。
   integrationMode: 'secure-bridge', // 'mock' | 'secure-bridge'
   bridgeEndpoint: window.DEPLOYMENT_CONFIG?.receptionSubmitEndpoint || '',
-  confirmationEmailEnabled: false,
+  confirmationEmailEnabled: true,
 
   // naturalConversation:true は自然会話モジュールを使用します。
   // routeInputToReception/suppressModelOutput/silenceMs 以下は従来方式へ戻した場合の設定です。
@@ -27,7 +27,7 @@ window.APP_CONFIG = Object.freeze({
     suppressModelOutput: true,
     inputSampleRate: 16000,
     outputSampleRate: 24000,
-    voiceName: 'Kore',
+    voiceName: 'Sulafat',
     fallbackToStep9Voice: true,
     handsFreeVoice: true,
     vadThreshold: 0.012,
@@ -36,5 +36,5 @@ window.APP_CONFIG = Object.freeze({
     maxUtteranceMs: 20000
   }),
 
-  environmentLabel: 'STEP10-5N 自然会話・検証版'
+  environmentLabel: 'STEP10-6 自然会話・確認メール連携版'
 });

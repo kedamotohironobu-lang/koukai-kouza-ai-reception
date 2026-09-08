@@ -492,7 +492,7 @@
       submissionResult=result;
       state.receiptNumber=result.receiptNumber;state.stage='complete';updateProgress();renderCompletion(result);
       setStatus('仮受付を登録しました（メール送信・受講確定は別途）');
-      if(!naturalMode())botSay('仮受付を登録しました。受付番号をご確認ください。',{autoListen:false});
+      if(!naturalMode())botSay('仮受付を登録しました。続いて画面の「確認メールを作成」を押し、メールアプリで送信してください。',{autoListen:false});
       return result;
     })();
     try{return await submissionPromise;}finally{submissionPromise=null;}
@@ -710,55 +710,48 @@
     els.suggestions.append(row);
   }
 
-  function renderCompletion(result) {
-    const c = state.selectedCourse;
-    const draft = buildEmailDraft(result.receiptNumber);
-    const emailEnabled = CONFIG.confirmationEmailEnabled === true && CONFIG.integrationMode === 'secure-bridge' && !result.mock;
+  function emailData(receiptNumber) {
+    return window.ConfirmationEmail.build(CONFIG, {
+      receiptNumber,affiliation:state.affiliation,name:state.name,phone:state.phone,
+      display:state.selectedCourse?.display,title:state.selectedCourse?.title,method:state.method
+    });
+  }
 
-    els.suggestions.innerHTML = `
+  function renderCompletion(result) {
+    let email;
+    try {email=emailData(result.receiptNumber);}
+    catch (_) {
+      els.suggestions.innerHTML=`<div class="complete-card"><h3>仮受付を登録しました</h3><p>受付番号：${escapeHtml(result.receiptNumber)}</p><p>確認メールの設定を確認してください。登録をやり直す必要はありません。</p></div>`;
+      return;
+    }
+    const emailEnabled=CONFIG.confirmationEmailEnabled===true && CONFIG.integrationMode==='secure-bridge' && !result.mock;
+    els.suggestions.innerHTML=`
       <div class="complete-card">
         <div class="complete-icon">✅</div>
-        <h3>${result.mock ? 'STEP9 画面テスト完了' : '仮受付が完了しました'}</h3>
-        <div>受付番号</div>
-        <div class="receipt-number">${escapeHtml(result.receiptNumber)}</div>
-        ${result.mock ? '<div class="demo-warning">この番号は画面確認用のDEMO番号です。Googleスプレッドシートには登録されていません。</div>' : '<p>この番号は大切に保管してください。</p>'}
-        <div class="email-draft">${escapeHtml(draft)}</div>
-        <div class="detail-actions" style="justify-content:center">
-          <button id="copyDraftBtn" class="action-btn secondary" type="button">確認メール文面をコピー</button>
-          <button id="openMailBtn" class="action-btn primary" type="button" ${emailEnabled ? '' : 'disabled'}>${emailEnabled ? 'メールアプリを開く' : 'STEP10-6で確認メール連携'}</button>
+        <h3>${result.mock?'画面テスト完了（実登録なし）':'仮受付を登録しました'}</h3>
+        <div>受付番号</div><div class="receipt-number">${escapeHtml(result.receiptNumber)}</div>
+        <p>次に、確認メールを作成し、メールアプリで送信してください。</p>
+        ${email.testMode?'<div class="demo-warning">検証用の送信先です。架空情報だけで試してください。</div>':''}
+        <p>送信先：${escapeHtml(email.recipient)}</p>
+        <div class="email-draft">${escapeHtml(email.preview)}</div>
+        <div class="detail-actions" style="justify-content:center;flex-wrap:wrap">
+          <button id="openMailBtn" class="action-btn primary" type="button" ${emailEnabled?'':'disabled'}>確認メールを作成</button>
+          <button id="copyDraftBtn" class="action-btn secondary" type="button">宛先・件名・本文をコピー</button>
         </div>
+        <p id="emailProgress" role="status">メールはまだ送信していません。仮受付は受講確定ではありません。</p>
+        <p>メールアプリが開かない場合は、文面をコピーし、普段お使いのメールで新規作成してください。</p>
       </div>`;
-
-    $('#copyDraftBtn')?.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(draft);
-        showToast('確認メール文面をコピーしました');
-      } catch {
-        showToast('コピーできませんでした。文面を選択してコピーしてください。');
-      }
+    $('#copyDraftBtn')?.addEventListener('click',async()=>{
+      try{await navigator.clipboard.writeText(email.preview);showToast('コピーしました。宛先・件名・本文をそれぞれメールへ貼り付けてください。');}
+      catch(_){showToast('コピーできませんでした。画面の文面を選択してコピーしてください。');}
     });
-
-    if (emailEnabled) {
-      $('#openMailBtn')?.addEventListener('click', () => {
-        const subject = `【公開講座受付確認】${result.receiptNumber}`;
-        location.href = `mailto:${encodeURIComponent(CONFIG.receptionEmail)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(draft)}`;
-      });
-    }
+    if(emailEnabled)$('#openMailBtn')?.addEventListener('click',()=>{
+      location.href=email.mailto;
+      $('#emailProgress').textContent='メールアプリで宛先と内容を確認し、送信してください。この画面では送信・受信の結果を確認できません。';
+    });
   }
 
-  function buildEmailDraft(receipt) {
-    return [
-      `送信先：${CONFIG.receptionEmail}`,
-      `件名：【公開講座受付確認】${receipt}`,
-      '',
-      `受付番号：${receipt}`,
-      `所属：${state.affiliation}`,
-      `氏名：${state.name}`,
-      `所属電話番号：${state.phone}`,
-      `希望講座：${state.selectedCourse.display} ${state.selectedCourse.title}`,
-      `受講方法：${state.method}`
-    ].join('\n');
-  }
+  function buildEmailDraft(receipt) {return emailData(receipt).preview;}
 
   function showSearchExamples() {
     els.suggestions.innerHTML = '';
