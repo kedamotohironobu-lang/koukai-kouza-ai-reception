@@ -39,7 +39,7 @@
   let submissionPromise = null;
   let submissionIdentity = null;
   let submissionResult = null;
-  const naturalMode = () => CONFIG.geminiLive?.naturalConversation === true && state.inputMode === 'voice';
+  const naturalMode = () => CONFIG.geminiLive?.naturalConversation === true;
 
   const state = {
     stage: 'landing',
@@ -221,6 +221,8 @@
   }
 
   function switchMode(mode, options = {}) {
+    const changedMode=state.inputMode!==mode;
+    if(changedMode){natural?.stop();if('speechSynthesis' in window)speechSynthesis.cancel();}
     state.inputMode = mode;
     const voice = mode === 'voice';
     state.autoVoiceEnabled = voice && (CONFIG.geminiLive || {}).handsFreeVoice !== false;
@@ -232,6 +234,14 @@
     els.chatTab.setAttribute('aria-selected', String(!voice));
     els.voicePanel.classList.toggle('hidden', !voice);
     els.chatPanel.classList.toggle('hidden', voice);
+    if(naturalMode()){
+      stopRecognition();
+      if(!voice)setTimeout(()=>els.chatInput.focus(),30);
+      if(state.stage!=='landing')void startNatural();
+      applyMobileModeClass(mode);
+      if(!options.silent)showToast(voice?'音声入力へ切り替えました':'文字入力へ切り替えました。マイクは使用しません。');
+      return;
+    }
     if (!voice) {
       natural?.stop();
       stopRecognition();
@@ -253,7 +263,7 @@
     if(!naturalMode() && submissionIdentity && !submissionResult){if(/^(はい|再試行|お願いします)[。!！\s]*$/.test(String(rawText).trim())){state.stage='confirm';void completeReception();}else showToast('登録結果が未確認です。同じ内容で再試行してください。');return;}
     const text = normalizeSpace(rawText);
     if (!text) return;
-    if(naturalMode()){natural?.send(text);return;}
+    if(naturalMode()){if(!natural?.sendUserText(text)){showToast('接続を確認しています。接続後にもう一度送信してください。');els.chatInput.value=text;}return;}
     cancelAutoVoiceTurn();
     clearGeminiNoSpeechTimer();
     state.autoVoiceRetryCount = 0;
@@ -501,10 +511,10 @@
   async function startNatural() {
     if(natural?.active || submissionPromise || state.stage==='complete')return;
     // A disconnected session reuses the draft, including an uncertain submission lock.
-    const previous=natural?.draft?.locked ? natural.draft : null;
+    const previous=natural?.draft || null;
     natural?.stop();
     natural=new window.NaturalReception({
-      courses:state.courses,core:CORE,config:CONFIG.geminiLive,
+      courses:state.courses,core:CORE,config:CONFIG.geminiLive,inputMode:state.inputMode,
       results:rows=>renderCourseCards(rows),
       status:t=>setStatus(t),speaker:()=>state.speakerOn,
       caption:t=>{els.liveTranscript.textContent=t;els.agentCaption.textContent=t.slice(-120);},
@@ -519,7 +529,7 @@
       submit:async d=>{state.selectedCourse=d.course;state.method=d.method;state.affiliation=d.affiliation;state.name=d.name;state.phone=d.phone;return registerCurrentReception();}
     });
     if(previous)natural.draft=previous;
-    els.mic.classList.add('listening');els.voicePrompt.textContent='会話中です（マイクを押すと一時停止）';
+    els.mic.classList.toggle('listening',state.inputMode==='voice');els.voicePrompt.textContent='会話中です（マイクを押すと一時停止）';
     await natural.start(previous?null:{courseKey:state.selectedCourse?.key||'',method:state.method,affiliation:state.affiliation,name:state.name,phone:state.phone});
     if(!natural.active)els.mic.classList.remove('listening');
   }

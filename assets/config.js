@@ -36,5 +36,5 @@ window.APP_CONFIG = Object.freeze({
     maxUtteranceMs: 20000
   }),
 
-  environmentLabel: 'STEP10-6 自然会話・確認メール連携版'
+  environmentLabel: 'STEP10-7 音声・チャット統一／メール照合版'
 });

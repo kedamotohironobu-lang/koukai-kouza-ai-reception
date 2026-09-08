@@ -61,15 +61,23 @@
     constructor(options) {
       this.o=options;this.draft=new ReceptionDraft(options.courses,options.core);this.active=false;this.epoch=0;this.sources=new Set();this.nextTime=0;this.audioChain=Promise.resolve();this.input='';this.output='';this.armed=false;this.awaitingSummary=false;this.summaryEnd=Infinity;this.pending=null;this.completed=null;this.cancelled=new Set();this.toolChain=Promise.resolve();
     }
-    send(text){if(this.active&&this.bridge?.isReady())this.bridge.sendText(text);}
+    send(text){if(this.active&&this.bridge?.isReady()){this.bridge.sendText(text);return true;}return false;}
+    sendUserText(text){
+      if(!this.active||!this.bridge?.isReady())return false;
+      if(this.output){this.o.message('bot',this.output);this.output='';}
+      const after=this.armed&&this.context.currentTime>=this.summaryEnd;
+      this.flushInput();this.lastInput=String(text);this.lastInputAfterSummary=after;this.textConsentRevision=after&&affirmative(text)?this.draft.revision:null;
+      this.o.message('user',String(text));
+      this.stopOutput();this.bridge.sendText(String(text));return true;
+    }
     async start(initial) {
       this.active=true; const epoch=++this.epoch;
       if(initial)this.draft.update(initial);
       try {
         const Audio=global.AudioContext||global.webkitAudioContext;
         this.context=new Audio();await this.context.resume();
-        const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-        if(!this.active||epoch!==this.epoch){stream.getTracks().forEach(t=>t.stop());return;}
+        const stream=this.o.inputMode==='chat'?null:await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+        if(!this.active||epoch!==this.epoch){stream?.getTracks().forEach(t=>t.stop());return;}
         this.stream=stream;
         this.bridge=new global.GeminiLiveBridge({ ...this.o.config,systemInstruction:instruction,tools:[{functionDeclarations:declarations}],
           realtimeInputConfig:{automaticActivityDetection:{disabled:false,prefixPaddingMs:300,silenceDurationMs:900},activityHandling:'START_OF_ACTIVITY_INTERRUPTS'},
@@ -77,14 +85,16 @@
           onMessage:m=>{if(this.active&&epoch===this.epoch)this.message(m);}
         });
         await this.bridge.connect();if(!this.active||epoch!==this.epoch)return;
+        if(stream){
         this.source=this.context.createMediaStreamSource(stream);
         this.processor=this.context.createScriptProcessor(2048,1,1);
         this.sink=this.context.createGain();this.sink.gain.value=0;
         this.source.connect(this.processor);this.processor.connect(this.sink);this.sink.connect(this.context.destination);
         this.processor.onaudioprocess=e=>{if(!this.active||this.paused)return;const input=e.inputBuffer.getChannelData(0);const bytes=new Uint8Array(input.length*2);const view=new DataView(bytes.buffer);for(let i=0;i<input.length;i++)view.setInt16(i*2,Math.round(Math.max(-1,Math.min(1,input[i]))*32767),true);let s='';for(const b of bytes)s+=String.fromCharCode(b);this.bridge.sendAudioPcmBase64(btoa(s),this.context.sampleRate);};
-        this.o.status('AI音声受付につながりました。途中でも話しかけられます。');
-        this.send('会話を開始してください。現在の受付下書きは '+JSON.stringify(this.draft.snapshot())+' 。未入力ならAI音声受付と名乗り、希望する講座を短く尋ねてください。');
-      }catch(e){if(this.active&&epoch===this.epoch)this.fail('音声を開始できませんでした。マイク許可と接続設定を確認し、チャット入力をご利用ください。');}
+        }
+        this.o.status(this.o.inputMode==='chat'?'チャット受付につながりました。文字で入力してください。声はSulafatです。':'AI音声受付につながりました。途中でも話しかけられます。');
+        this.send((this.o.inputMode==='chat'?'文字入力モードです。マイクで話すよう案内せず、文字で入力するよう案内してください。':'音声入力モードです。')+' 会話を開始してください。現在の受付下書きは '+JSON.stringify(this.draft.snapshot())+' 。未入力ならAI音声受付と名乗り、希望する講座を短く尋ねてください。');
+      }catch(e){if(this.active&&epoch===this.epoch)this.fail('音声を開始できませんでした。マイク許可と接続設定を確認し、接続を確認して、入力タブを押して接続し直してください。');}
     }
     fail(text){this.stop();this.o.status(text);this.o.message('bot',text);}
     message(m) {
@@ -122,9 +132,9 @@
         case 'search_courses': {const rows=this.o.core.searchCourses(this.o.courses,clean(a.query));this.o.results?.(rows.slice(0,5));return {ok:true,courses:rows.slice(0,5),total:rows.length,note:'講座の選択は利用者に確認。締切後は登録不可。'};}
         case 'get_guidance':return {ok:true,guidance:FAQ};
         case 'get_reception':return {ok:true,...this.draft.snapshot()};
-        case 'update_reception':{const before=this.draft.revision;const r=this.draft.update(a);if(r.ok){if(before!==this.draft.revision){this.armed=false;this.awaitingSummary=false;}this.o.draft(r,false);}return r;}
-        case 'prepare_confirmation':{this.flushInput();this.lastInput='';this.lastInputAfterSummary=false;this.armed=false;const r=this.draft.prepare();if(r.ok){this.awaitingSummary=true;this.o.draft(r,true);}return r;}
-        case 'submit_confirmed_reception':{this.flushInput();if(!this.armed||!this.lastInputAfterSummary||!affirmative(this.lastInput))return {ok:false,error:'読み返し後の明確な同意を確認できません。内容を確認し、画面の「この内容で仮受付」を押してください。'};this.armed=false;return this.submit();}
+        case 'update_reception':{const before=this.draft.revision;const r=this.draft.update(a);if(r.ok){if(before!==this.draft.revision){this.textConsentRevision=null;this.armed=false;this.awaitingSummary=false;}this.o.draft(r,false);}return r;}
+        case 'prepare_confirmation':{this.textConsentRevision=null;this.flushInput();this.lastInput='';this.lastInputAfterSummary=false;this.armed=false;const r=this.draft.prepare();if(r.ok){this.awaitingSummary=true;this.o.draft(r,true);}return r;}
+        case 'submit_confirmed_reception':{this.flushInput();if(!(this.textConsentRevision===this.draft.revision&&this.draft.prepared===this.draft.revision)&&(!this.armed||!this.lastInputAfterSummary||!affirmative(this.lastInput)))return {ok:false,error:'読み返し後の明確な同意を確認できません。内容を確認し、画面の「この内容で仮受付」を押してください。'};this.armed=false;this.textConsentRevision=null;return this.submit();}
         default:return {ok:false,error:'未対応の操作です。'};
       }
     }
