@@ -2,6 +2,13 @@
   'use strict';
   const fields = ['courseKey', 'method', 'affiliation', 'name', 'phone'];
   const clean = (v) => String(v ?? '').normalize('NFKC').trim();
+  function normalizeMethod(value) {
+    const v=clean(value);
+    if (/^(集合研修|集合|対面|対面方式|対面研修|会場|会場参加|来場|来場参加)$/.test(v)) return '集合研修';
+    if (/^(vod|オンデマンド|オンデマンド方式|オンデマンド配信|動画|動画視聴|動画配信)$/i.test(v)) return 'VOD';
+    return v;
+  }
+  const allowedMethods = course => course ? [...(course.onsiteAvailable===true?['集合研修']:[]),...(course.vodAvailable===true?['VOD']:[])] : [];
   const affirmative = (text) => /^(はい|お願いします|それでお願いします|この内容でお願いします|この内容で申し込みます|大丈夫です|はいお願いします)[。.!！\s]*$/.test(clean(text).replace(/[、,\s]/g, ''));
   function past(date) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return true;
@@ -27,11 +34,12 @@
         if(typeof patch[k]!=='string') return {ok:false,error:`${k}は文字列で指定してください。`};
         next[k]=clean(patch[k]);
       }
+      next.method=normalizeMethod(next.method);
       if(next.courseKey!==this.data.courseKey && !Object.prototype.hasOwnProperty.call(patch,'method')) next.method='';
       const course=this.courses.find(c=>c.key===next.courseKey);
       if(next.courseKey && !course) return {ok:false,error:'正式マスターにない講座です。検索してください。'};
       if(course && past(course.deadline)) return {ok:false,error:'締切日を過ぎている、または締切日が不明です。職員に確認してください。',course};
-      if(next.method && (!course || !['集合研修','VOD'].includes(next.method) || !(next.method==='VOD'?course.vodAvailable:course.onsiteAvailable))) return {ok:false,error:'この受講方法は選べません。',course};
+      if(next.method && (!course || !['集合研修','VOD'].includes(next.method) || !(next.method==='VOD'?course.vodAvailable:course.onsiteAvailable))) return {ok:false,error:!course?'先に講座を選択してください。':'指定された受講方法はこの講座では選べません。allowedMethodsから選び直してください。別日程や代替方式を推測しないでください。',requestedMethod:next.method,allowedMethods:allowedMethods(course),course};
       for(const [k,max] of [['affiliation',100],['name',80]]) if(next[k] && (next[k].length<2||next[k].length>max)) return {ok:false,error:`${k}の聞き取り内容を確認してください。`};
       if(next.phone) {next.phone=next.phone.replace(/[\s()+－ー-]/g,''); if(!/^\d{8,15}$/.test(next.phone)) return {ok:false,error:'所属の電話番号を8〜15桁の数字で確認してください。'};}
       if(JSON.stringify(next)!==JSON.stringify(this.data)) {this.data=next;this.revision++;this.prepared=null;}
@@ -41,13 +49,14 @@
   }
   const declarations=[
     {name:'search_courses',description:'正式講座マスターを検索する。講座の演題・日程・方法は結果だけを根拠にする。',parameters:{type:'OBJECT',properties:{query:{type:'STRING'}},required:['query']}},
-    {name:'update_reception',description:'利用者が明示した項目をまとめて下書きへ反映。質問文や相づちは項目に入れない。訂正もここで行い、返された不足項目だけ質問する。登録はしない。',parameters:{type:'OBJECT',properties:Object.fromEntries(fields.map(k=>[k,{type:'STRING'}]))}},
+    {name:'update_reception',description:'利用者が明示した項目をまとめて下書きへ反映。質問文や相づちは項目に入れない。訂正もここで行い、返された不足項目だけ質問する。登録はしない。',parameters:{type:'OBJECT',properties:Object.fromEntries(fields.map(k=>[k,k==='method'?{type:'STRING',enum:['集合研修','VOD'],description:'対面・会場参加は集合研修、オンデマンド・動画視聴はVODとして指定する。'}:{type:'STRING'}]))}},
     {name:'get_reception',description:'現在の下書きと不足項目を確認。',parameters:{type:'OBJECT',properties:{}}},
     {name:'get_guidance',description:'公開講座の問い合わせ資料に基づく案内を取得。途中の質問に答えたら受付へ戻る。',parameters:{type:'OBJECT',properties:{}}},
     {name:'prepare_confirmation',description:'全項目が揃ったら必ず実行し、返された内容を読み返して仮受付への同意を求める。まだ登録しない。',parameters:{type:'OBJECT',properties:{}}},
     {name:'submit_confirmed_reception',description:'確認の読み返しが終了した後の、利用者の明確な同意でのみ実行する。成功結果が来るまでは登録できたと言わない。',parameters:{type:'OBJECT',properties:{}}}
   ];
   const instruction=[
+    '集合研修・対面・会場参加は同じ受講方法です。VOD・オンデマンド・動画視聴も同じ受講方法です。update_receptionには必ず集合研修またはVODを指定してください。search_coursesのallowedMethodsにある方法だけを案内してください。集合研修が不可なのに対面なら可能と案内したり、別日程を作ったりしてはいけません。エラー時は検索結果と指定値を確認してください。',
     'あなたは兵庫県立総合教育センターの公開講座AI音声受付です。最初にAI音声受付と名乗り、温かく親しみやすい日本語で、少しゆっくり、語尾を柔らかく話してください。明るすぎず、落ち着いた調子にしてください。電話番号は一桁ずつはっきり確認してください。人間の職員のふりはしません。',
     '通常は1〜2文。毎回「承知しました」を繰り返さず、長い定型文や過剰な敬語を避けてください。一度に質問するのは不足事項を一つだけ。ただし利用者が複数項目を話したらupdate_receptionでまとめて取り込み、同じことを聞き直さないでください。',
     '話し終わるまで待ち、言い直しは最新の明示内容を優先。氏名の漢字を推測せず不明なら読みを保持し画面で確認。電話番号が不明瞭なら聞き返す。途中の質問に短く答えてから、まだ聞いていない項目に戻る。',
@@ -129,7 +138,7 @@
     async tool(call){
       const a=call.args||{};
       switch(call.name){
-        case 'search_courses': {const rows=this.o.core.searchCourses(this.o.courses,clean(a.query));this.o.results?.(rows.slice(0,5));return {ok:true,courses:rows.slice(0,5),total:rows.length,note:'講座の選択は利用者に確認。締切後は登録不可。'};}
+        case 'search_courses': {const rows=this.o.core.searchCourses(this.o.courses,clean(a.query));this.o.results?.(rows.slice(0,5));return {ok:true,courses:rows.slice(0,5).map(course=>({...course,allowedMethods:allowedMethods(course)})),total:rows.length,note:'講座の選択は利用者に確認。締切後は登録不可。'};}
         case 'get_guidance':return {ok:true,guidance:FAQ};
         case 'get_reception':return {ok:true,...this.draft.snapshot()};
         case 'update_reception':{const before=this.draft.revision;const r=this.draft.update(a);if(r.ok){if(before!==this.draft.revision){this.textConsentRevision=null;this.armed=false;this.awaitingSummary=false;}this.o.draft(r,false);}return r;}
